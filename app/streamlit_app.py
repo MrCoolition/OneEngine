@@ -899,6 +899,7 @@ def create_workflow_row(
         "batch_id": batch_id,
         "source_row_number": int(source_row_number),
         "workflow_request_key": f"{case_number or 'row'}-{source_row_number}",
+        "ruleset_id": "product_request",
         "raw_row": deepcopy(normalized["source"]),
         "normalized_row": normalized,
         "business": clean_text(fields["business"]),
@@ -970,11 +971,84 @@ def refresh_derived(row: MutableMapping[str, Any]) -> MutableMapping[str, Any]:
     return row
 
 
+def _distillery_field(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", clean_text(value).lower()).strip("_")
+
+
+def _distillery_stable_value(value: Any) -> str:
+    if not isinstance(value, bool) and isinstance(value, (int, float, Decimal)):
+        number = float(value)
+        if not math.isnan(number):
+            return f"n:{number:.12g}"
+    return f"s:{normalize_key(value)}"
+
+
+def _distillery_evidence_hash(raw_row: Mapping[str, Any]) -> str:
+    canonical: dict[str, Any] = {}
+    for key, value in raw_row.items():
+        field = _distillery_field(key)
+        if not field:
+            continue
+        if field not in canonical or not clean_text(canonical[field]):
+            canonical[field] = value
+    payload = [
+        (key, _distillery_stable_value(value))
+        for key, value in sorted(canonical.items())
+    ]
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _distillery_number(value: Any) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float, Decimal)):
+        number = float(value)
+        return None if math.isnan(number) else number
+    text = clean_text(value).replace(",", "").strip()
+    if not text or text.lower() == "blank":
+        return None
+    is_percent = text.endswith("%")
+    if is_percent:
+        text = text[:-1].strip()
+    match = re.search(r"-?\d+(?:\.\d+)?", text)
+    if not match:
+        return None
+    number = float(match.group(0))
+    return number / 100.0 if is_percent else number
+
+
 def context_for_row(row: Mapping[str, Any]) -> dict[str, Any]:
     normalized = row.get("normalized_row") or {}
+    raw_row = row.get("raw_row") or {}
     context: dict[str, Any] = {}
+    for key, value in raw_row.items():
+        field = _distillery_field(key)
+        if field and (field not in context or not clean_text(context[field])):
+            context[field] = value
     context.update(deepcopy(normalized.get("fields") or {}))
     context.update(deepcopy(normalized.get("derived") or {}))
+    context["input_action"] = raw_row.get("ACTION", row.get("upstream_action"))
+    context["input_if_in_stock_action"] = raw_row.get(
+        "If In Stock: Action",
+        row.get("upstream_if_in_stock_action"),
+    )
+    context["input_buysmart_action"] = raw_row.get(
+        "Buysmart Action",
+        row.get("buysmart_action"),
+    )
+    context["conversion_va_num"] = _distillery_number(
+        context.get("conversion_va")
+    )
+    context["__evidence_hash"] = _distillery_evidence_hash(raw_row)
+    context["__ruleset_id"] = clean_text(
+        row.get("ruleset_id") or "product_request"
+    )
     context["current_action_key"] = normalize_key(row.get("action"))
     context["current_buysmart_key"] = normalize_key(row.get("buysmart_action"))
     context["action"] = clean_text(row.get("action"))
@@ -987,13 +1061,24 @@ def _number_for_compare(value: Any) -> float:
     return parsed if parsed is not None else 0.0
 
 
+_IN_LIST_CACHE: dict[int, tuple[Any, frozenset[str]]] = {}
+
+
 def _in_list(left: Any, right: Any) -> bool:
     value = normalize_key(left)
     if isinstance(right, list):
         options = right
+        cache_key = id(right)
     else:
         options = [item.strip() for item in clean_text(right).split(",") if item.strip()]
-    return any(normalize_key(item) == value for item in options)
+        cache_key = 0
+    cached = _IN_LIST_CACHE.get(cache_key)
+    normalized_options = cached[1] if cached and cached[0] is right else None
+    if normalized_options is None:
+        normalized_options = frozenset(normalize_key(item) for item in options)
+        if cache_key:
+            _IN_LIST_CACHE[cache_key] = (right, normalized_options)
+    return value in normalized_options
 
 
 def evaluate_predicate(
@@ -1158,9 +1243,14 @@ def execute_row(
         row["updated_at"] = now
         return row
 
+    runtime_context = context_for_row(row)
     for variant in ordered:
         predicate = variant.get("predicate_json")
-        if not isinstance(predicate, Mapping) or not evaluate_predicate(predicate, context_for_row(row), reference_lists):
+        if not isinstance(predicate, Mapping) or not evaluate_predicate(
+            predicate,
+            runtime_context,
+            reference_lists,
+        ):
             continue
         actions = variant.get("action_json") or []
         if not isinstance(actions, list):
@@ -1181,6 +1271,7 @@ def execute_row(
         refresh_derived(row)
         if bool_value(variant.get("stop_processing")):
             break
+        runtime_context = context_for_row(row)
 
     if not clean_text(row.get("buysmart_action")) and not bool_value(row.get("excluded")):
         row["buysmart_action"] = "Review" if bool_value(row.get("needs_review")) else "Assigned"

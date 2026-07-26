@@ -1,0 +1,17 @@
+[
+  {
+    "run_id": "09dadbe4b72b643ff1db",
+    "created_at": "2026-07-26T15:25:13.301115+00:00",
+    "profile_id": "product_request",
+    "profile_version": "1.1.0",
+    "source_paths": [
+      "C:\\Coolition_Engine\\OneEngine\\before.zip",
+      "C:\\Coolition_Engine\\OneEngine\\after.zip"
+    ],
+    "row_count": 6922,
+    "rule_count": 170,
+    "validation_accuracy": 1.0,
+    "holdout_accuracy": 0.6936742843424751,
+    "deployment_eligible": true
+  }
+]

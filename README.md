@@ -1,86 +1,157 @@
 # ONE ENGINE
 
-ONE ENGINE is a Snowflake-native compliance rules platform for deterministic,
-auditable PRF/SORF/SRF decisioning.
+ONE ENGINE is a Snowflake-native, deterministic rules platform. Its Rules
+Distillery repeatedly learns executable rule catalogs from paired BEFORE/AFTER
+evidence while preserving row-level provenance, validation results, and prior
+runs.
 
-## Runtime architecture
+The first ruleset profile is **Product Request**: PRF, SORF, and SRF daily
+decision workbooks. Neon is not a runtime dependency.
 
-- **Streamlit in Snowflake** provides ingestion, execution, analyst review,
-  reporting, rule administration, simulation, and diagnostics.
-- **Snowpark** is the only application persistence path.
-- **Snowflake** is the runtime source of truth for batches, rows, rules,
-  executions, results, audit events, and reference lists.
-- The historical Neon database is reference-only and is not required by the
-  application or deployment.
+## Product Request result
 
-## Repository layout
+The current evidence set contains ten BEFORE workbooks and ten corresponding
+AFTER workbooks:
 
-```text
-app/
-  streamlit_app.py                  Main Streamlit in Snowflake application
-snowflake/
-  compliance_rules_backend.sql     Idempotent seven-table backend provisioning
-before.zip                          Source workbooks without decisions
-after.zip                           Expected/analyst-completed workbooks
-Rules_Engine-main (3).zip           Original implementation archive
+| Measure | Result |
+|---|---:|
+| Aligned row pairs | 6,922 / 6,922 |
+| Unmatched rows | 0 |
+| Contradictory identical BEFORE states | 0 |
+| Generated rules | 170 |
+| Exact accumulated-corpus parity | 100.00% |
+| Mean leave-one-date-out accuracy | 69.37% |
+
+These are intentionally separate guarantees. The catalog contains:
+
+- **General rules** learned from reusable filter context and promoted only when
+  the leaf is 100% pure with at least three supporting rows.
+- **Evidence rules** that close deterministic residuals for previously observed
+  BEFORE states.
+
+The combined catalog reproduces every supplied AFTER decision. The temporal
+score is the honest estimate for a previously unseen daily file; it is not
+represented as 100%. Adding reviewed BEFORE/AFTER pairs and rerunning the
+Distillery expands the evidence base and creates a new, independently validated
+catalog version.
+
+## How the Rules Distillery works
+
+```mermaid
+flowchart LR
+    B["BEFORE sources"] --> A["Format adapters"]
+    F["Ruleset profile"] --> A
+    A --> M["Deterministic row alignment"]
+    C["AFTER sources"] --> A
+    M --> P["Canonical features and output labels"]
+    P --> I["General rule induction"]
+    I --> E["Evidence residual closure"]
+    E --> V["Corpus and temporal validation"]
+    V --> G{"Deployment gate"}
+    G -->|"pass"| S["Catalog JSON and Snowflake MERGE"]
+    G -->|"fail"| D["Disabled draft catalog and diagnostics"]
+    S --> R["ONE ENGINE runtime"]
 ```
 
-## Snowflake deployment
+The engine is not tied to Excel or Product Request. Source adapters currently
+accept:
 
-1. Run `snowflake/compliance_rules_backend.sql` with an administrative role
-   that can use the target warehouse, database, and schema.
-2. Verify that all seven `COMPLIANCE_RULES_*` tables are returned by the
-   readiness queries at the end of the script.
-3. Create or update a Streamlit in Snowflake app using
-   `app/streamlit_app.py` as the main file.
-4. Add the packages listed in `environment.yml`.
-5. Run **Settings → Verify backend tables** in ONE ENGINE.
+- XLSX/XLSM and other pandas-supported workbook formats
+- CSV, TSV, and delimited text
+- JSON, JSONL, and NDJSON
+- Parquet and Feather when their optional pandas engines are installed
+- ZIP archives, directories, or individual files
 
-The application does not create tables at runtime. It uses explicit,
-fully-qualified Snowflake object names and seeds only missing bundled rules and
-reference values.
+Every ruleset is configured by a versioned profile defining output fields,
+column aliases, identity strategies, matching thresholds, feature budgets,
+validation grouping, and an optional feature projector.
 
-## Current data contract
+## Run the Product Request Distillery
 
-The active Snowflake backend contains:
+Install the analysis dependencies:
 
-- 53 rules
-- 2 source batches
-- 1,426 workflow rows
-- 2 execution runs
-- 1,426 row results
-- 5 audit events
-- 7 reference-list values
+```powershell
+py -3 -m pip install -r requirements-distillery.txt
+```
 
-This matches the expected 53-rule catalog. No Neon synchronization is part of
-the production path.
+Run the full, deployment-gated workflow:
 
-## Safety and auditability
+```powershell
+py -3 -m one_engine.distillery distill `
+  --profile product_request `
+  --before before.zip `
+  --after after.zip `
+  --output catalogs/product_request
+```
 
-- Dry-run, full-batch, and selected-row execution modes
-- Ordered predicates and actions with stop-processing behavior
-- Per-row execution traces and result snapshots
-- Auditable analyst overrides and administrative changes
-- CSV/XLSX exports and downloadable diagnostics
-- Runtime DDL disabled
+Use `--skip-holdouts` only for a faster draft iteration. The command exits with
+code 2 unless all rows align, accumulated-corpus parity is 100%, and no
+contradictory identical states exist.
+
+The current manifest points to a content-addressed run directory containing:
+
+- `report.json` — matching, label, rule, parity, contradiction, and holdout
+  diagnostics
+- `catalog.json` — executable ONE ENGINE catalog entries
+- `load_snowflake.sql` — transactional loader that retires obsolete generated
+  rules for this ruleset before merging the current catalog
+- `history.json` — retained run lineage and quality metrics
+
+Generated predicates are scoped by `__ruleset_id`, so future workflow catalogs
+cannot accidentally execute against Product Request rows.
+
+## Add the next workflow
+
+Do not fork the engine. Add a new profile:
+
+1. Create `one_engine/distillery/profile_catalog/<ruleset>.json`.
+2. Declare its output contract, aliases, identity groups, similarity fields,
+   induction fields, and validation group.
+3. Use the default raw-field projector or register a ruleset-specific projector
+   in `one_engine/distillery/rulesets/`.
+4. Supply accumulated BEFORE and AFTER sources as matching ZIP members,
+   directory files, or individual files.
+5. Run the same CLI and require the deployment gate to pass.
+6. Add a runtime contract test proving that emitted predicates and actions
+   execute through ONE ENGINE.
+
+Raw fields are exposed generically at runtime. Any custom derived feature used
+by a new projector must also be registered in that workflow's runtime context.
+
+## Snowflake runtime
+
+- `app/streamlit_app.py` provides ingestion, execution, analyst review,
+  reporting, rule administration, simulation, and diagnostics.
+- `snowflake/compliance_rules_backend.sql` provisions the seven-table backend.
+- Snowpark is the persistence path for batches, rows, rules, runs, results,
+  audit events, and reference lists.
+- Generated catalogs load into
+  `FOODBUY_MASALA_PROD.COMPLIANCE_LAB.COMPLIANCE_RULES_RULES`.
+
+Deployment:
+
+1. Run `snowflake/compliance_rules_backend.sql`.
+2. Run the current generated `load_snowflake.sql`.
+3. Deploy `app/streamlit_app.py` as the Streamlit in Snowflake main file.
+4. Add the packages from `environment.yml`.
+5. Use **Settings → Verify backend tables** in ONE ENGINE.
+
+The application never creates backend tables at runtime.
 
 ## Verification
 
-Run the deterministic engine contracts:
+Run all contracts:
 
 ```powershell
 py -3 -m unittest discover -s tests -v
 ```
 
-Measure decisions against the paired historical workbooks:
+The Product Request integration contract verifies:
 
-```powershell
-py -3 tools/golden_parity.py
-```
-
-The parity tool joins rows by their complete non-decision payload, so workbook
-reordering does not create false mismatches. It reports exact and semantic
-agreement separately. BuySmart closeout is excluded from the parity score
-because the supplied “after” workbooks leave that field blank.
+- all 6,922 rows align;
+- the distilled catalog has exact historical parity and no contradictions;
+- catalog entries are executable and scoped;
+- the same catalog produces all 6,922 expected decisions through the actual
+  Streamlit engine.
 
 Do not commit `.env` or `.streamlit/secrets.toml`.
