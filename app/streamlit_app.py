@@ -4,23 +4,6 @@ from __future__ import annotations
 ONE ENGINE — Snowflake-native compliance rules platform
 ========================================================
 
-A single-file Streamlit application that ports the supplied Compliance Rules
-codebase to Snowpark/Snowflake. It includes:
-
-* Snowflake persistence against a separately provisioned backend schema
-* Bundled DAF rule catalog seeding
-* CSV/XLSX workbook ingestion without a separate service
-* Ordered predicate/action rule execution with stop-processing and traces
-* Dry runs, full runs, and selected-row runs
-* Analyst workbench and auditable overrides
-* Rule catalog creation, editing, enable/disable, deletion, and simulation
-* Compliance bucket reporting and CSV/XLSX exports
-* Live-build source proof and downloadable root-cause diagnostics
-
-Deploy this file as the main file of a Streamlit in Snowflake application.
-Provision the backend first with ``compliance_rules_backend.sql``. The app never
-creates tables at runtime. Its owner role needs USAGE on the warehouse/database/
-schema and SELECT, INSERT, UPDATE, and DELETE on the seven target tables.
 """
 
 import base64
