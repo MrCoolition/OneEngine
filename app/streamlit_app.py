@@ -1,10 +1,6 @@
 from __future__ import annotations
 
-"""
-ONE ENGINE — Snowflake-native compliance rules platform
-========================================================
-
-"""
+# ONE ENGINE — single-file Snowflake Streamlit rules platform.
 
 import base64
 import csv
@@ -10023,6 +10019,20 @@ def app_styles() -> None:
             margin-bottom: var(--fb-space-6);
         }
 
+        .one-engine-wordmark {
+            color: #8AA4AE;
+            font-family: "DM Sans", "Avenir Next", "Montserrat", "Inter",
+                -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            font-size: 13px;
+            font-weight: 650;
+            line-height: 20px;
+            letter-spacing: .48em;
+            text-transform: uppercase;
+            white-space: nowrap;
+            margin: 0 0 var(--fb-space-6);
+            padding: var(--fb-space-1) 0;
+        }
+
         .rules-card {
             color: var(--fb-neutral-700);
             background: var(--fb-neutral-white);
@@ -10121,6 +10131,14 @@ def render_page_header(title: str, subtitle: str = "", kicker: str = "Rules Oper
     st.title(title)
     if subtitle:
         st.markdown(f'<div class="rules-subtitle">{xml_escape(subtitle)}</div>', unsafe_allow_html=True)
+
+
+def render_app_wordmark() -> None:
+    require_streamlit()
+    st.markdown(
+        f'<div class="one-engine-wordmark">{xml_escape(APP_TITLE)}</div>',
+        unsafe_allow_html=True,
+    )
 
 
 def require_selected_batch(selected_batch: Mapping[str, Any] | None) -> bool:
@@ -13407,6 +13425,7 @@ def main() -> None:
         initial_sidebar_state="expanded",
     )
     app_styles()
+    render_app_wordmark()
     render_live_build_proof(brand_image)
     migrate_session_state()
     self_check = ensure_application_self_check()
