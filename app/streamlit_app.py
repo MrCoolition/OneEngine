@@ -52,11 +52,11 @@ except Exception:  # Enables import-based engine tests outside Snowflake.
 
 
 APP_TITLE = "ONE ENGINE"
-APP_VERSION = "2026.07.26-one-engine-live-product-request-v4"
+APP_VERSION = "2026.07.26-one-engine-brand-shell-v5"
 SESSION_STATE_SCHEMA_VERSION = 7
 WORKBOOK_PARSER_VERSION = "2026.07.24-v7-uncached"
 MAX_DIAGNOSTIC_EVENTS = 50
-DEPLOYMENT_SENTINEL = "ONE_ENGINE_FOODBUY_DESIGN_SYSTEM_LIVE_PRODUCT_REQUEST_20260726"
+DEPLOYMENT_SENTINEL = "ONE_ENGINE_FOODBUY_DESIGN_SYSTEM_BRAND_SHELL_20260726"
 LIVE_BUILD_BADGE = "ONE ENGINE · SNOWFLAKE · LIVE"
 FOODBUY_DESIGN_SYSTEM_REFERENCE = (
     "https://69925e4ee40e16a198c7c5cf-xdindjzhxi.chromatic.com/"
@@ -7278,12 +7278,43 @@ def app_styles() -> None:
             border-right: 1px solid var(--fb-neutral-100);
         }
 
+        header[data-testid="stHeader"],
+        [data-testid="stHeader"],
+        .stAppHeader {
+            color: var(--fb-neutral-700) !important;
+            background: rgba(247, 248, 249, .98) !important;
+            border-bottom: 1px solid var(--fb-neutral-100);
+            box-shadow: none !important;
+        }
+
+        [data-testid="stSidebarCollapsedControl"] {
+            color: var(--fb-neutral-700) !important;
+        }
+
+        [data-testid="stSidebarCollapsedControl"] button {
+            color: var(--fb-neutral-700) !important;
+            background: var(--fb-neutral-white) !important;
+            border: 1px solid var(--fb-neutral-100) !important;
+            border-radius: var(--fb-radius-sm) !important;
+            box-shadow: var(--fb-shadow-100) !important;
+        }
+
+        [data-testid="stSidebarCollapsedControl"] button:hover {
+            color: var(--fb-primary-600) !important;
+            background: var(--fb-primary-50) !important;
+            border-color: var(--fb-primary-100) !important;
+        }
+
+        [data-testid="stLogo"] img,
+        [data-testid="stSidebar"] img {
+            border-radius: var(--fb-radius-md);
+        }
+
         [data-testid="stSidebar"] > div:first-child {
             padding-top: var(--fb-space-4);
         }
 
         [data-testid="stSidebar"] img {
-            border-radius: var(--fb-radius-md);
             box-shadow: var(--fb-shadow-100);
         }
 
@@ -9966,41 +9997,76 @@ def render_settings_page(store: SnowflakeRulesStore) -> None:
 
 
 def one_engine_brand_image_path() -> str:
-    """Find an optional image uploaded beside the Snowflake Streamlit file."""
+    """Find the optional Snowflake project asset across supported app roots."""
     file_path = clean_text(globals().get("__file__"))
-    directory = os.path.dirname(file_path) if file_path else "."
+    file_directory = os.path.dirname(os.path.abspath(file_path)) if file_path else ""
+    try:
+        working_directory = os.path.abspath(os.getcwd())
+    except Exception:
+        working_directory = ""
+    roots: list[str] = []
+
+    def add_root(value: str) -> None:
+        normalized = os.path.normpath(value) if value else ""
+        if normalized and normalized not in roots and os.path.isdir(normalized):
+            roots.append(normalized)
+
+    add_root(file_directory)
+    add_root(working_directory)
+    if file_directory:
+        add_root(os.path.dirname(file_directory))
+    if working_directory:
+        add_root(os.path.join(working_directory, "app"))
+        add_root(os.path.join(working_directory, "streamlit"))
+
     preferred = (
         "oneengine_brand.png",
         "one_engine_brand.png",
         "oneengine.png",
         "one_engine.png",
     )
-    for name in preferred:
-        candidate = os.path.join(directory, name)
-        if os.path.isfile(candidate):
-            return candidate
-    try:
-        for name in sorted(os.listdir(directory)):
-            lowered = name.lower()
-            if (
-                "oneengine" in lowered.replace("_", "").replace("-", "")
-                and lowered.endswith((".png", ".jpg", ".jpeg", ".webp"))
-            ):
-                candidate = os.path.join(directory, name)
-                if os.path.isfile(candidate):
-                    return candidate
-    except Exception:
-        pass
+    for root in roots:
+        for name in preferred:
+            candidate = os.path.join(root, name)
+            if os.path.isfile(candidate):
+                return os.path.abspath(candidate)
+    for root in roots:
+        try:
+            for name in sorted(os.listdir(root)):
+                lowered = name.lower()
+                if (
+                    "oneengine" in lowered.replace("_", "").replace("-", "")
+                    and lowered.endswith((".png", ".jpg", ".jpeg", ".webp"))
+                ):
+                    candidate = os.path.join(root, name)
+                    if os.path.isfile(candidate):
+                        return os.path.abspath(candidate)
+        except Exception:
+            continue
     return ""
 
 
-def render_live_build_proof() -> None:
+def render_live_build_proof(brand_image: str = "") -> None:
     """Render an unmistakable identity before Snowflake initialization."""
     require_streamlit()
     identity = source_code_fingerprint()
-    brand_image = one_engine_brand_image_path()
+    brand_image = brand_image or one_engine_brand_image_path()
     if brand_image:
+        logo_renderer = getattr(st, "logo", None)
+        if callable(logo_renderer):
+            try:
+                logo_renderer(brand_image, icon_image=brand_image)
+            except TypeError:
+                logo_renderer(brand_image)
+            except Exception:
+                pass
         st.sidebar.image(brand_image, use_container_width=True)
+    else:
+        st.sidebar.warning(
+            "Brand asset unavailable in this session. Add "
+            "`oneengine_brand.png` beside `streamlit_app.py`, then restart "
+            "the Snowflake Streamlit session."
+        )
     st.sidebar.markdown(f"### {APP_TITLE}")
     st.sidebar.markdown(
         f'<div class="rules-live-badge">{xml_escape(LIVE_BUILD_BADGE)}</div>',
@@ -10044,9 +10110,15 @@ def render_sidebar(store: SnowflakeRulesStore) -> tuple[str, list[dict[str, Any]
 
 def main() -> None:
     require_streamlit()
-    st.set_page_config(page_title=APP_TITLE, page_icon="⚙️", layout="wide", initial_sidebar_state="expanded")
+    brand_image = one_engine_brand_image_path()
+    st.set_page_config(
+        page_title=APP_TITLE,
+        page_icon=brand_image or "⚙️",
+        layout="wide",
+        initial_sidebar_state="expanded",
+    )
     app_styles()
-    render_live_build_proof()
+    render_live_build_proof(brand_image)
     migrate_session_state()
     self_check = ensure_application_self_check()
     if clean_text(self_check.get("status")) == "failed":

@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -53,7 +55,21 @@ class OneEngineContractTests(unittest.TestCase):
         self.assertIn("--fb-shadow-100:", css)
         self.assertIn("min-height: 44px", css)
         self.assertIn("prefers-reduced-motion", css)
+        self.assertIn('[data-testid="stHeader"]', css)
+        self.assertIn('[data-testid="stSidebarCollapsedControl"]', css)
+        self.assertIn("background: rgba(247, 248, 249, .98)", css)
         self.assertIn("ONE_ENGINE_FOODBUY_DESIGN_SYSTEM", self.app.DEPLOYMENT_SENTINEL)
+
+    def test_brand_asset_resolution_uses_snowflake_project_root(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            expected = Path(directory) / "oneengine_brand.png"
+            expected.write_bytes(b"test-brand")
+            with patch.object(self.app.os, "getcwd", return_value=directory):
+                resolved = self.app.one_engine_brand_image_path()
+
+        self.assertEqual(str(expected.resolve()), resolved)
+        source = APP_PATH.read_text(encoding="utf-8")
+        self.assertIn('logo_renderer(brand_image, icon_image=brand_image)', source)
 
     def test_embedded_catalog_shape(self) -> None:
         rules, report = self.app.build_seed_catalog()

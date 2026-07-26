@@ -27,7 +27,11 @@ oneengine_brand.png
 ```
 
 Keep it beside `streamlit_app.py`. The app discovers that filename at runtime;
-the image is not encoded or embedded in Python.
+the image is not encoded or embedded in Python. If the file is uploaded after
+the Snowflake Streamlit session has already started, restart the session so
+Snowflake copies the new project asset into the running app. The artwork is
+shown in the expanded sidebar and registered with `st.logo`, which keeps it
+available in the app shell when the sidebar is collapsed.
 
 ## Foodbuy design-system alignment
 
