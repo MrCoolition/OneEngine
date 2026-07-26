@@ -29,6 +29,27 @@ oneengine_brand.png
 Keep it beside `streamlit_app.py`. The app discovers that filename at runtime;
 the image is not encoded or embedded in Python.
 
+## Foodbuy design-system alignment
+
+ONE ENGINE's visual layer follows the
+[Foodbuy Design System Storybook](https://69925e4ee40e16a198c7c5cf-xdindjzhxi.chromatic.com/?path=/story/introduction--getting-started).
+The design compatibility layer remains inside `streamlit_app.py` and maps
+Foodbuy foundations onto Streamlit's native components:
+
+- the exact primary, secondary, success, warning, danger, and neutral tokens;
+- DM Sans/Inter typography roles and hierarchy;
+- the 4px spacing rhythm and responsive 12-column breakpoints;
+- 8px control and 12px card/panel radii;
+- Foodbuy elevation 100–900 shadows;
+- buttons, inputs, selects, uploaders, forms, feedback alerts, tabs, sidebar
+  navigation, cards, metrics, tables, and status badges;
+- 44px minimum interaction targets, visible focus rings, accessible contrast,
+  and reduced-motion support.
+
+The Storybook's Stencil custom elements are not runtime dependencies. Native
+Streamlit widgets keep their Snowflake behavior and receive the Foodbuy visual
+contract through CSS, preserving the one-Python-file deployment model.
+
 There are no generated catalog files, profile JSON files, loader scripts, or
 runtime Python packages to deploy. Candidate catalogs exist only in the current
 browser session until an authorized user promotes them. Promotion writes the

@@ -29,6 +29,32 @@ class OneEngineContractTests(unittest.TestCase):
         self.assertEqual("ONE ENGINE", self.app.APP_TITLE)
         self.assertIn("one-engine", self.app.APP_VERSION)
 
+    def test_foodbuy_design_foundations_contract(self) -> None:
+        captured: list[str] = []
+
+        class FakeStreamlit:
+            @staticmethod
+            def markdown(value, **_kwargs):
+                captured.append(value)
+
+        original_streamlit = self.app.st
+        try:
+            self.app.st = FakeStreamlit()
+            self.app.app_styles()
+        finally:
+            self.app.st = original_streamlit
+
+        css = "\n".join(captured)
+        self.assertIn("--fb-primary-500: #7D36C9", css)
+        self.assertIn("--fb-neutral-100: #DEE1E6", css)
+        self.assertIn('--fb-font: "DM Sans", "Inter"', css)
+        self.assertIn("--fb-radius-sm: 8px", css)
+        self.assertIn("--fb-radius-md: 12px", css)
+        self.assertIn("--fb-shadow-100:", css)
+        self.assertIn("min-height: 44px", css)
+        self.assertIn("prefers-reduced-motion", css)
+        self.assertIn("ONE_ENGINE_FOODBUY_DESIGN_SYSTEM", self.app.DEPLOYMENT_SENTINEL)
+
     def test_embedded_catalog_shape(self) -> None:
         rules, report = self.app.build_seed_catalog()
 

@@ -52,12 +52,15 @@ except Exception:  # Enables import-based engine tests outside Snowflake.
 
 
 APP_TITLE = "ONE ENGINE"
-APP_VERSION = "2026.07.26-one-engine-single-file-distillery-v2"
+APP_VERSION = "2026.07.26-one-engine-foodbuy-design-v3"
 SESSION_STATE_SCHEMA_VERSION = 7
 WORKBOOK_PARSER_VERSION = "2026.07.24-v7-uncached"
 MAX_DIAGNOSTIC_EVENTS = 50
-DEPLOYMENT_SENTINEL = "ONE_ENGINE_SINGLE_FILE_DISTILLERY_20260726"
+DEPLOYMENT_SENTINEL = "ONE_ENGINE_FOODBUY_DESIGN_SYSTEM_20260726"
 LIVE_BUILD_BADGE = "ONE ENGINE · SNOWFLAKE · LIVE"
+FOODBUY_DESIGN_SYSTEM_REFERENCE = (
+    "https://69925e4ee40e16a198c7c5cf-xdindjzhxi.chromatic.com/"
+)
 TARGET_ROLE = "FOODBUY_AXIOM_COMPLIANCE_PROD"
 TARGET_WAREHOUSE = "COMPLIANCE_PROD_WH"
 TARGET_DATABASE = "FOODBUY_MASALA_PROD"
@@ -7060,12 +7063,391 @@ def app_styles() -> None:
     st.markdown(
         """
         <style>
-        .block-container {padding-top: 1.2rem; padding-bottom: 3rem; max-width: 1500px;}
-        [data-testid="stMetricValue"] {font-size: 1.7rem;}
-        .rules-kicker {font-size: .78rem; letter-spacing: .08em; text-transform: uppercase; opacity: .68; font-weight: 700;}
-        .rules-subtitle {font-size: .95rem; opacity: .78; margin-top: -.35rem; margin-bottom: 1rem;}
-        .rules-card {border: 1px solid rgba(128,128,128,.25); border-radius: .7rem; padding: .8rem 1rem; margin: .35rem 0;}
-        .rules-muted {opacity: .7;}
+        :root {
+            /* Foodbuy foundations: exact active Storybook tokens. */
+            --fb-primary-50: #F9F5FC;
+            --fb-primary-100: #E5D7F4;
+            --fb-primary-500: #7D36C9;
+            --fb-primary-600: #642BA1;
+            --fb-primary-800: #321650;
+            --fb-secondary-50: #F3F8FE;
+            --fb-secondary-500: #0E78F2;
+            --fb-secondary-600: #0B60C2;
+            --fb-secondary-800: #063061;
+            --fb-success-50: #F3FCFA;
+            --fb-success-500: #0FC4A3;
+            --fb-success-600: #0C9D82;
+            --fb-success-800: #064E41;
+            --fb-warning-50: #FFFCF2;
+            --fb-warning-500: #FFBB00;
+            --fb-warning-600: #CC9600;
+            --fb-warning-800: #664B00;
+            --fb-danger-50: #FEF3F8;
+            --fb-danger-500: #E6095A;
+            --fb-danger-600: #B80846;
+            --fb-danger-800: #5C0427;
+            --fb-neutral-white: #FFFFFF;
+            --fb-neutral-50: #F7F8F9;
+            --fb-neutral-100: #DEE1E6;
+            --fb-neutral-200: #BCC4CC;
+            --fb-neutral-300: #9BA6B3;
+            --fb-neutral-400: #798999;
+            --fb-neutral-500: #586B80;
+            --fb-neutral-600: #465666;
+            --fb-neutral-700: #35404D;
+            --fb-neutral-800: #232B33;
+            --fb-neutral-900: #12151A;
+            --fb-radius-xs: 4px;
+            --fb-radius-sm: 8px;
+            --fb-radius-md: 12px;
+            --fb-radius-pill: 1000px;
+            --fb-shadow-100: 0 2px 4px rgba(21, 33, 54, .08);
+            --fb-shadow-200: 0 2px 8px rgba(21, 33, 54, .10);
+            --fb-shadow-300: 0 8px 24px rgba(21, 33, 54, .12);
+            --fb-shadow-900: 0 1px 32px rgba(21, 33, 54, .12);
+            --fb-space-1: 4px;
+            --fb-space-2: 8px;
+            --fb-space-3: 12px;
+            --fb-space-4: 16px;
+            --fb-space-5: 20px;
+            --fb-space-6: 24px;
+            --fb-space-8: 32px;
+            --fb-space-10: 40px;
+            --fb-space-12: 48px;
+            --fb-font: "DM Sans", "Inter", -apple-system, BlinkMacSystemFont,
+                "Segoe UI", sans-serif;
+        }
+
+        html, body, .stApp, .stApp button, .stApp input,
+        .stApp textarea, .stApp select {
+            font-family: var(--fb-font);
+        }
+
+        .stApp {
+            background: var(--fb-neutral-50);
+            color: var(--fb-neutral-700);
+        }
+
+        .block-container {
+            max-width: 1200px;
+            padding: var(--fb-space-6) var(--fb-space-8) var(--fb-space-12);
+        }
+
+        h1, h2, h3, h4, h5, h6 {
+            color: var(--fb-neutral-900);
+            font-family: var(--fb-font);
+            font-weight: 600;
+            letter-spacing: -.015em;
+        }
+
+        h1 {font-size: 36px; line-height: 1.2;}
+        h2 {font-size: 28px; line-height: 32px;}
+        h3 {font-size: 24px; line-height: 28px;}
+        p, li, label {font-size: 14px; line-height: 20px;}
+        a {color: var(--fb-secondary-600);}
+        a:hover {color: var(--fb-secondary-800);}
+
+        [data-testid="stSidebar"] {
+            background: var(--fb-neutral-white);
+            border-right: 1px solid var(--fb-neutral-100);
+        }
+
+        [data-testid="stSidebar"] > div:first-child {
+            padding-top: var(--fb-space-4);
+        }
+
+        [data-testid="stSidebar"] img {
+            border-radius: var(--fb-radius-md);
+            box-shadow: var(--fb-shadow-100);
+        }
+
+        [data-testid="stSidebar"] [role="radiogroup"] label {
+            min-height: 44px;
+            border-radius: var(--fb-radius-sm);
+            padding: 8px 12px;
+            transition: background-color .15s ease, color .15s ease;
+        }
+
+        [data-testid="stSidebar"] [role="radiogroup"] label:hover {
+            background: var(--fb-neutral-50);
+        }
+
+        [data-testid="stSidebar"] [role="radiogroup"] label:has(input:checked) {
+            background: var(--fb-primary-50);
+            color: var(--fb-primary-600);
+            font-weight: 600;
+        }
+
+        .stButton > button,
+        .stDownloadButton > button,
+        [data-testid="stFormSubmitButton"] > button {
+            min-height: 44px;
+            border: 1px solid var(--fb-primary-500);
+            border-radius: var(--fb-radius-sm);
+            padding: 0 var(--fb-space-4);
+            font-family: var(--fb-font);
+            font-size: 14px;
+            font-weight: 600;
+            box-shadow: none;
+            transition: background-color .15s ease, border-color .15s ease,
+                color .15s ease, box-shadow .15s ease, transform .15s ease;
+        }
+
+        .stButton > button[kind="primary"],
+        [data-testid="stFormSubmitButton"] > button[kind="primary"] {
+            color: var(--fb-neutral-white);
+            background: var(--fb-primary-500);
+        }
+
+        .stButton > button[kind="primary"]:hover,
+        [data-testid="stFormSubmitButton"] > button[kind="primary"]:hover {
+            background: var(--fb-primary-600);
+            border-color: var(--fb-primary-600);
+            box-shadow: var(--fb-shadow-100);
+        }
+
+        .stButton > button[kind="secondary"],
+        .stDownloadButton > button {
+            color: var(--fb-primary-600);
+            background: var(--fb-neutral-white);
+        }
+
+        .stButton > button[kind="secondary"]:hover,
+        .stDownloadButton > button:hover {
+            color: var(--fb-primary-800);
+            background: var(--fb-primary-50);
+            border-color: var(--fb-primary-600);
+        }
+
+        .stButton > button:disabled,
+        .stDownloadButton > button:disabled {
+            color: var(--fb-neutral-500);
+            background: var(--fb-neutral-50);
+            border-color: var(--fb-neutral-200);
+            opacity: .72;
+        }
+
+        button:focus-visible,
+        input:focus-visible,
+        textarea:focus-visible,
+        [role="button"]:focus-visible,
+        [role="tab"]:focus-visible,
+        [role="radio"]:focus-visible,
+        [role="checkbox"]:focus-visible {
+            outline: 2px solid var(--fb-primary-500) !important;
+            outline-offset: 2px;
+        }
+
+        [data-baseweb="input"],
+        [data-baseweb="select"] > div,
+        [data-baseweb="textarea"],
+        .stTextInput input,
+        .stNumberInput input,
+        .stTextArea textarea,
+        .stDateInput input {
+            color: var(--fb-neutral-700);
+            background: var(--fb-neutral-white);
+            border-color: var(--fb-neutral-400) !important;
+            border-radius: var(--fb-radius-sm) !important;
+            min-height: 44px;
+        }
+
+        [data-baseweb="input"]:focus-within,
+        [data-baseweb="select"] > div:focus-within,
+        [data-baseweb="textarea"]:focus-within {
+            border-color: var(--fb-primary-500) !important;
+            box-shadow: 0 0 0 2px rgba(125, 54, 201, .16) !important;
+        }
+
+        [data-baseweb="popover"],
+        [data-baseweb="menu"],
+        [data-baseweb="calendar"] {
+            border: 1px solid var(--fb-neutral-100);
+            border-radius: var(--fb-radius-md);
+            box-shadow: var(--fb-shadow-300);
+        }
+
+        [data-testid="stFileUploaderDropzone"] {
+            min-height: 120px;
+            background: var(--fb-neutral-white);
+            border: 1px dashed var(--fb-neutral-400);
+            border-radius: var(--fb-radius-md);
+        }
+
+        [data-testid="stFileUploaderDropzone"]:hover {
+            background: var(--fb-primary-50);
+            border-color: var(--fb-primary-500);
+        }
+
+        [data-testid="stMetric"] {
+            min-height: 112px;
+            padding: var(--fb-space-4);
+            background: var(--fb-neutral-white);
+            border: 1px solid var(--fb-neutral-100);
+            border-radius: var(--fb-radius-md);
+            box-shadow: var(--fb-shadow-100);
+        }
+
+        [data-testid="stMetricLabel"] {
+            color: var(--fb-neutral-500);
+            font-size: 12px;
+            line-height: 16px;
+        }
+
+        [data-testid="stMetricValue"] {
+            color: var(--fb-neutral-900);
+            font-size: 28px;
+            line-height: 32px;
+            font-weight: 600;
+        }
+
+        [data-testid="stAlert"] {
+            border: 1px solid var(--fb-neutral-100);
+            border-radius: var(--fb-radius-sm);
+            box-shadow: none;
+        }
+
+        [data-testid="stExpander"] {
+            overflow: hidden;
+            background: var(--fb-neutral-white);
+            border: 1px solid var(--fb-neutral-100);
+            border-radius: var(--fb-radius-md);
+        }
+
+        [data-testid="stForm"] {
+            background: var(--fb-neutral-white);
+            border: 1px solid var(--fb-neutral-100);
+            border-radius: var(--fb-radius-md);
+            padding: var(--fb-space-6);
+            box-shadow: var(--fb-shadow-100);
+        }
+
+        .stTabs [data-baseweb="tab-list"] {
+            gap: var(--fb-space-1);
+            border-bottom: 1px solid var(--fb-neutral-100);
+        }
+
+        .stTabs [role="tab"] {
+            min-height: 44px;
+            color: var(--fb-neutral-500);
+            border-radius: var(--fb-radius-sm) var(--fb-radius-sm) 0 0;
+            font-weight: 600;
+        }
+
+        .stTabs [role="tab"]:hover {
+            color: var(--fb-primary-600);
+            background: var(--fb-neutral-50);
+        }
+
+        .stTabs [role="tab"][aria-selected="true"] {
+            color: var(--fb-primary-600);
+            background: var(--fb-primary-50);
+        }
+
+        [data-testid="stDataFrame"],
+        [data-testid="stTable"] {
+            overflow: hidden;
+            background: var(--fb-neutral-white);
+            border: 1px solid var(--fb-neutral-100);
+            border-radius: var(--fb-radius-sm);
+        }
+
+        hr {
+            border-color: var(--fb-neutral-100);
+            margin: var(--fb-space-6) 0;
+        }
+
+        .rules-kicker {
+            display: inline-flex;
+            align-items: center;
+            min-height: 24px;
+            color: var(--fb-primary-600);
+            background: var(--fb-primary-50);
+            border: 1px solid var(--fb-primary-100);
+            border-radius: var(--fb-radius-pill);
+            font-size: 12px;
+            line-height: 16px;
+            letter-spacing: .08em;
+            text-transform: uppercase;
+            font-weight: 700;
+            padding: var(--fb-space-1) var(--fb-space-2);
+            margin-bottom: var(--fb-space-2);
+        }
+
+        .rules-live-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: var(--fb-space-2);
+            color: var(--fb-success-800);
+            background: var(--fb-success-50);
+            border: 1px solid var(--fb-success-500);
+            border-radius: var(--fb-radius-pill);
+            padding: var(--fb-space-1) var(--fb-space-3);
+            font-size: 12px;
+            line-height: 16px;
+            font-weight: 700;
+        }
+
+        .rules-live-badge::before {
+            content: "";
+            width: 8px;
+            height: 8px;
+            background: var(--fb-success-500);
+            border-radius: var(--fb-radius-pill);
+        }
+
+        .rules-subtitle {
+            max-width: 76ch;
+            color: var(--fb-neutral-500);
+            font-size: 16px;
+            line-height: 24px;
+            margin-top: -8px;
+            margin-bottom: var(--fb-space-6);
+        }
+
+        .rules-card {
+            color: var(--fb-neutral-700);
+            background: var(--fb-neutral-white);
+            border: 1px solid var(--fb-neutral-100);
+            border-radius: var(--fb-radius-md);
+            padding: var(--fb-space-4);
+            margin: var(--fb-space-2) 0;
+            box-shadow: var(--fb-shadow-100);
+        }
+
+        .rules-muted {
+            color: var(--fb-neutral-500);
+        }
+
+        @media (min-width: 1280px) {
+            .block-container {
+                max-width: 1200px;
+                padding-left: var(--fb-space-12);
+                padding-right: var(--fb-space-12);
+            }
+        }
+
+        @media (min-width: 1920px) {
+            .block-container {max-width: 1680px;}
+        }
+
+        @media (max-width: 767px) {
+            .block-container {
+                padding: var(--fb-space-4);
+            }
+            h1 {font-size: 28px; line-height: 32px;}
+            h2 {font-size: 24px; line-height: 28px;}
+            [data-testid="stMetric"] {min-height: 96px;}
+        }
+
+        @media (prefers-reduced-motion: reduce) {
+            *, *::before, *::after {
+                scroll-behavior: auto !important;
+                animation-duration: .01ms !important;
+                animation-iteration-count: 1 !important;
+                transition-duration: .01ms !important;
+            }
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -9343,7 +9725,10 @@ def render_live_build_proof() -> None:
     if brand_image:
         st.sidebar.image(brand_image, use_container_width=True)
     st.sidebar.markdown(f"### {APP_TITLE}")
-    st.sidebar.success(LIVE_BUILD_BADGE)
+    st.sidebar.markdown(
+        f'<div class="rules-live-badge">{xml_escape(LIVE_BUILD_BADGE)}</div>',
+        unsafe_allow_html=True,
+    )
     st.sidebar.caption(APP_VERSION)
     st.sidebar.code(DEPLOYMENT_SENTINEL, language="text")
     st.sidebar.caption(
