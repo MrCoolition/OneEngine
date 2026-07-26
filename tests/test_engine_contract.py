@@ -86,6 +86,78 @@ class OneEngineContractTests(unittest.TestCase):
             self.app.TABLE_SUFFIXES,
         )
 
+    def test_live_product_request_source_contract(self) -> None:
+        app = self.app
+
+        class FakeStore(app.SnowflakeRulesStore):
+            def __init__(self, rows):
+                super().__init__(object())
+                self.source_rows = list(rows)
+                self.queries = []
+
+            def collect(self, query, params=None):
+                self.queries.append((query, params))
+                return list(self.source_rows)
+
+        rows = [
+            {
+                "BUSINESS": "Compass USA",
+                "REQUEST_TYPE": "SORF",
+                "CASE_NUMBER": "WO-200",
+                "CREATED_DATE": "2026-07-26",
+                "ACTION": "Review",
+            },
+            {
+                "BUSINESS": "Compass Canada",
+                "REQUEST_TYPE": "PRF",
+                "CASE_NUMBER": "WO-100",
+                "CREATED_DATE": "2026-07-25",
+                "ACTION": "Approved",
+            },
+        ]
+        store = FakeStore(rows)
+        parsed, source_hash, metadata = store.load_live_product_request_data()
+
+        self.assertEqual("V_OE_PRODUCTREQUESTS", app.LIVE_PRODUCT_REQUEST_VIEW)
+        self.assertEqual(
+            'SELECT * FROM "FOODBUY_MASALA_PROD"."COMPLIANCE_LAB"."V_OE_PRODUCTREQUESTS"',
+            store.queries[0][0],
+        )
+        self.assertEqual(2, len(parsed.rows))
+        self.assertEqual("Snowflake live view", parsed.sheet_name)
+        self.assertIn("Business", parsed.columns)
+        self.assertIn("Type", parsed.columns)
+        self.assertIn("Case#", parsed.columns)
+        self.assertIn("Date Created", parsed.columns)
+        self.assertEqual(64, len(source_hash))
+        self.assertEqual(
+            "FOODBUY_MASALA_PROD.COMPLIANCE_LAB.V_OE_PRODUCTREQUESTS",
+            metadata["source_view"],
+        )
+        normalized = [
+            app.create_normalized_row(row)
+            for row in parsed.rows
+        ]
+        self.assertEqual(
+            {"PRF", "SORF"},
+            {row["fields"]["requestType"] for row in normalized},
+        )
+        self.assertEqual(
+            {"WO-100", "WO-200"},
+            {row["fields"]["caseNumber"] for row in normalized},
+        )
+
+        reversed_store = FakeStore(reversed(rows))
+        _, reversed_hash, _ = reversed_store.load_live_product_request_data()
+        self.assertEqual(source_hash, reversed_hash)
+
+        source = APP_PATH.read_text(encoding="utf-8")
+        self.assertIn('"Use Live Product Request Data"', source)
+        self.assertIn(
+            'source_kind = "SNOWFLAKE_VIEW"',
+            source,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

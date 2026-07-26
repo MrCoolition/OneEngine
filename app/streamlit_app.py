@@ -52,11 +52,11 @@ except Exception:  # Enables import-based engine tests outside Snowflake.
 
 
 APP_TITLE = "ONE ENGINE"
-APP_VERSION = "2026.07.26-one-engine-foodbuy-design-v3"
+APP_VERSION = "2026.07.26-one-engine-live-product-request-v4"
 SESSION_STATE_SCHEMA_VERSION = 7
 WORKBOOK_PARSER_VERSION = "2026.07.24-v7-uncached"
 MAX_DIAGNOSTIC_EVENTS = 50
-DEPLOYMENT_SENTINEL = "ONE_ENGINE_FOODBUY_DESIGN_SYSTEM_20260726"
+DEPLOYMENT_SENTINEL = "ONE_ENGINE_FOODBUY_DESIGN_SYSTEM_LIVE_PRODUCT_REQUEST_20260726"
 LIVE_BUILD_BADGE = "ONE ENGINE · SNOWFLAKE · LIVE"
 FOODBUY_DESIGN_SYSTEM_REFERENCE = (
     "https://69925e4ee40e16a198c7c5cf-xdindjzhxi.chromatic.com/"
@@ -65,6 +65,7 @@ TARGET_ROLE = "FOODBUY_AXIOM_COMPLIANCE_PROD"
 TARGET_WAREHOUSE = "COMPLIANCE_PROD_WH"
 TARGET_DATABASE = "FOODBUY_MASALA_PROD"
 TARGET_SCHEMA = "COMPLIANCE_LAB"
+LIVE_PRODUCT_REQUEST_VIEW = "V_OE_PRODUCTREQUESTS"
 TABLE_PREFIX = "COMPLIANCE_RULES"
 COMPILER_VERSION = "2026-06-01.daf-logic-v2-snowpark"
 USER_RULE_PRIORITY_FLOOR = 900_000
@@ -84,6 +85,9 @@ HEADER_ALIASES = {
     "case #": "Case#",
     "case": "Case#",
     "case#": "Case#",
+    "case number": "Case#",
+    "request type": "Type",
+    "created date": "Date Created",
     "subcategory": "Sub Category",
     "sub category": "Sub Category",
     "buy smart action": "Buysmart Action",
@@ -92,6 +96,9 @@ HEADER_ALIASES = {
     "if in-stock action": "If In Stock: Action",
     "if in stock action": "If In Stock: Action",
     "if in stock: action": "If In Stock: Action",
+    "one time or permanent": "One-Time or Permanent",
+    "conversion va pct": "Conversion VA%",
+    "conversion va percent": "Conversion VA%",
     "dstdin": "DSTDIN",
 }
 
@@ -5380,6 +5387,9 @@ def run_application_self_check() -> dict[str, Any]:
             "parse_source_workbook_for_ui",
             "parsed_workbook_to_payload",
             "run_result_to_payload",
+            "LIVE_PRODUCT_REQUEST_VIEW",
+            "load_live_product_request_data",
+            "Use Live Product Request Data",
             "run_rules_distillery",
             "promote_distilled_catalog",
             "oneengine_brand.png",
@@ -5490,6 +5500,27 @@ def snowflake_row_dict(row: Any) -> dict[str, Any]:
     return {clean_text(key).lower(): value for key, value in raw.items()}
 
 
+def snowflake_source_row_dict(row: Any) -> dict[str, Any]:
+    """Preserve source column names while converting a Snowpark result row."""
+    if isinstance(row, Mapping):
+        raw = dict(row)
+    elif hasattr(row, "as_dict"):
+        try:
+            raw = row.as_dict(recursive=True)
+        except TypeError:
+            raw = row.as_dict()
+    else:
+        try:
+            raw = dict(row)
+        except Exception:
+            return {}
+    return {
+        clean_text(key): _plain_data(value)
+        for key, value in raw.items()
+        if clean_text(key)
+    }
+
+
 def timestamp_text(value: Any) -> str:
     if isinstance(value, datetime):
         if value.tzinfo is None:
@@ -5547,6 +5578,84 @@ class SnowflakeRulesStore:
         if key not in self.tables:
             raise KeyError(f"Unknown table key: {key}")
         return self.tables[key]
+
+    def live_product_request_view(self) -> str:
+        view = self._identifier(
+            LIVE_PRODUCT_REQUEST_VIEW,
+            "LIVE_PRODUCT_REQUEST_VIEW",
+        )
+        return f"{self.schema_name}.{self._quoted(view)}"
+
+    def load_live_product_request_data(
+        self,
+    ) -> tuple[ParsedWorkbook, str, dict[str, Any]]:
+        """Snapshot the live Product Request view into the workbook contract."""
+        qualified_view = self.live_product_request_view()
+        source_rows = self.collect(f"SELECT * FROM {qualified_view}")
+        records: list[dict[str, Any]] = []
+        discovered_columns: list[str] = []
+        for source_row in source_rows:
+            raw = snowflake_source_row_dict(source_row)
+            canonical = collapse_raw_row(raw)
+            if not any(clean_text(value) for value in canonical.values()):
+                continue
+            records.append(canonical)
+            for column in canonical:
+                if column not in discovered_columns:
+                    discovered_columns.append(column)
+        if not records:
+            raise ValueError(
+                f"{qualified_view} returned no non-empty Product Request rows."
+            )
+        serialized_rows = [
+            json.dumps(
+                _plain_data(record),
+                default=json_default,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            for record in records
+        ]
+        ordered_records = [
+            record
+            for _, record in sorted(
+                zip(serialized_rows, records),
+                key=lambda item: item[0],
+            )
+        ]
+        ordered_columns = [
+            column for column in EXPECTED_HEADERS if column in discovered_columns
+        ] + [
+            column for column in discovered_columns if column not in EXPECTED_HEADERS
+        ]
+        display_view = (
+            f"{self.database}.{self.schema}.{LIVE_PRODUCT_REQUEST_VIEW}"
+        )
+        content = "\n".join(
+            [
+                display_view,
+                *sorted(serialized_rows),
+            ]
+        ).encode("utf-8")
+        source_hash = hashlib.sha256(content).hexdigest()
+        parsed = ParsedWorkbook(
+            file_name=LIVE_PRODUCT_REQUEST_VIEW,
+            sheet_name="Snowflake live view",
+            columns=ordered_columns,
+            rows=ordered_records,
+            warnings=[],
+            source_row_numbers=list(range(1, len(ordered_records) + 1)),
+        )
+        metadata = {
+            "source_type": "snowflake_view",
+            "source_view": display_view,
+            "qualified_source_view": qualified_view,
+            "snapshot_sha256": source_hash,
+            "snapshot_row_count": len(ordered_records),
+            "snapshot_at": iso_now(),
+        }
+        return parsed, source_hash, metadata
 
     def collect(self, query: str, params: Sequence[Any] | None = None) -> list[Any]:
         if params is None:
@@ -6020,15 +6129,29 @@ class SnowflakeRulesStore:
     def create_batch(
         self,
         parsed: ParsedWorkbook,
-        source_bytes: bytes,
+        source_bytes: bytes | None,
         batch_name: str = "",
         reporting_date: date | str | None = None,
+        *,
+        source_kind: str = "",
+        source_sha256: str = "",
+        source_metadata: Mapping[str, Any] | None = None,
+        initial_status: str = "",
+        audit_action: str = "",
     ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         if not parsed.rows:
-            raise ValueError("The source workbook contains no data rows.")
+            raise ValueError("The Product Request source contains no data rows.")
         batch_id = new_id()
         timestamp = iso_now()
         extension = parsed.file_name.rsplit(".", 1)[-1].upper() if "." in parsed.file_name else "FILE"
+        supplied_hash = clean_text(source_sha256).lower()
+        if supplied_hash and not re.fullmatch(r"[a-f0-9]{64}", supplied_hash):
+            raise ValueError("The supplied source SHA-256 is invalid.")
+        if not supplied_hash and source_bytes is None:
+            raise ValueError(
+                "Source bytes or a validated source SHA-256 are required."
+            )
+        content_hash = supplied_hash or hashlib.sha256(source_bytes or b"").hexdigest()
         if isinstance(reporting_date, datetime):
             reporting_value = reporting_date.date().isoformat()
         elif isinstance(reporting_date, date):
@@ -6040,18 +6163,19 @@ class SnowflakeRulesStore:
         batch = {
             "id": batch_id,
             "name": clean_text(batch_name) or f"{parsed.file_name} · {timestamp[:10]}",
-            "source_kind": extension,
+            "source_kind": clean_text(source_kind).upper() or extension,
             "reporting_date": reporting_value,
-            "status": "Uploaded",
+            "status": clean_text(initial_status) or "Uploaded",
             "row_count": len(parsed.rows),
             "source_file_name": parsed.file_name,
             "source_sheet_name": parsed.sheet_name,
-            "file_sha256": hashlib.sha256(source_bytes).hexdigest(),
+            "file_sha256": content_hash,
             "warnings": list(parsed.warnings),
             "metadata": {
                 "columns": list(parsed.columns),
                 "ingested_by": self.current_user(),
                 "app_version": APP_VERSION,
+                "source": _plain_data(source_metadata or {}),
             },
             "archived": False,
             "created_at": timestamp,
@@ -6100,13 +6224,15 @@ class SnowflakeRulesStore:
                 entity_type="batch",
                 entity_id=batch_id,
                 batch_id=batch_id,
-                action="ingest_workbook",
+                action=clean_text(audit_action) or "ingest_workbook",
                 after=batch,
                 details={
                     "source_file_name": parsed.file_name,
                     "source_sheet_name": parsed.sheet_name,
+                    "source_kind": batch["source_kind"],
                     "row_count": len(workflow_rows),
                     "file_sha256": batch["file_sha256"],
+                    "source": _plain_data(source_metadata or {}),
                 },
             )
         return batch, workflow_rows
@@ -7810,76 +7936,195 @@ def render_workbook_parse_failure(diagnostics: Mapping[str, Any], source_hash: s
 def render_process_workbook_page(store: SnowflakeRulesStore) -> None:
     render_page_header(
         "Process Workbook",
-        "Upload a daily action file, inspect normalization, create a persistent batch, and optionally execute immediately.",
+        "Choose uploaded or live Product Request data, inspect normalization, create a persistent batch, and optionally execute immediately.",
         kicker="Ingestion",
     )
-    uploaded = st.file_uploader(
-        "Daily action file",
-        type=["csv", "txt", "tsv", "xlsx", "xlsm"],
-        help="Every rerun reads the current uploader bytes directly, validates the Open XML package, parses the source worksheet, and records downloadable root-cause diagnostics.",
+    source_option = st.radio(
+        "Product Request data source",
+        ["Upload a file", "Use Live Product Request Data"],
+        horizontal=True,
+        key="process_workbook_source",
     )
-    if uploaded is None:
-        st.markdown(
-            "Upload a CSV, XLSX, or XLSM file. The source is normalized into workflow rows; the original values remain available for audit and export."
-        )
-        return
+    parsed: ParsedWorkbook | None = None
+    source_bytes: bytes | None = None
+    source_hash = ""
+    source_name = ""
+    source_kind = ""
+    source_metadata: dict[str, Any] = {}
+    initial_status = ""
+    audit_action = ""
+    diagnostics: Mapping[str, Any] | None = None
+    is_live_source = source_option == "Use Live Product Request Data"
 
-    try:
-        source_bytes = uploaded.getvalue()
-        if not isinstance(source_bytes, bytes):
-            source_bytes = bytes(source_bytes)
-        if not source_bytes:
-            raise ValueError("The uploaded file contains zero bytes.")
-        source_hash = hashlib.sha256(source_bytes).hexdigest()
-        declared_size = getattr(uploaded, "size", None)
-        if declared_size not in (None, 0) and int(declared_size) != len(source_bytes):
-            raise RuntimeError(
-                f"Upload byte-count mismatch: Streamlit reported {int(declared_size):,} bytes but returned {len(source_bytes):,} bytes."
+    if not is_live_source:
+        uploaded = st.file_uploader(
+            "Daily action file",
+            type=["csv", "txt", "tsv", "xlsx", "xlsm"],
+            help="Every rerun reads the current uploader bytes directly, validates the Open XML package, parses the source worksheet, and records downloadable root-cause diagnostics.",
+        )
+        if uploaded is None:
+            st.markdown(
+                "Upload a CSV, XLSX, or XLSM file. The source is normalized into workflow rows; the original values remain available for audit and export."
             )
-        retry_key = f"_workbook_retry_nonce_{source_hash[:16]}"
-        retry_nonce = int(st.session_state.get(retry_key) or 0)
-        outcome = parse_source_workbook_for_ui(uploaded.name, source_hash, source_bytes, retry_nonce)
-    except Exception as exc:
-        render_actionable_exception(
-            "The uploaded file could not reach the workbook parser.",
-            exc,
-            component="Workbook upload/cache boundary",
-            context={
-                "file_name": clean_text(getattr(uploaded, "name", "")),
-                "declared_size": getattr(uploaded, "size", None),
-                "mime_type": clean_text(getattr(uploaded, "type", "")),
-                "parser_version": WORKBOOK_PARSER_VERSION,
-            },
+            return
+
+        try:
+            source_bytes = uploaded.getvalue()
+            if not isinstance(source_bytes, bytes):
+                source_bytes = bytes(source_bytes)
+            if not source_bytes:
+                raise ValueError("The uploaded file contains zero bytes.")
+            source_hash = hashlib.sha256(source_bytes).hexdigest()
+            declared_size = getattr(uploaded, "size", None)
+            if declared_size not in (None, 0) and int(declared_size) != len(source_bytes):
+                raise RuntimeError(
+                    f"Upload byte-count mismatch: Streamlit reported {int(declared_size):,} bytes but returned {len(source_bytes):,} bytes."
+                )
+            retry_key = f"_workbook_retry_nonce_{source_hash[:16]}"
+            retry_nonce = int(st.session_state.get(retry_key) or 0)
+            outcome = parse_source_workbook_for_ui(
+                uploaded.name,
+                source_hash,
+                source_bytes,
+                retry_nonce,
+            )
+        except Exception as exc:
+            render_actionable_exception(
+                "The uploaded file could not reach the workbook parser.",
+                exc,
+                component="Workbook upload/cache boundary",
+                context={
+                    "file_name": clean_text(getattr(uploaded, "name", "")),
+                    "declared_size": getattr(uploaded, "size", None),
+                    "mime_type": clean_text(getattr(uploaded, "type", "")),
+                    "parser_version": WORKBOOK_PARSER_VERSION,
+                },
+            )
+            return
+        diagnostics = outcome.get("diagnostics") if isinstance(outcome, Mapping) else None
+        if not isinstance(diagnostics, Mapping):
+            diagnostics = {
+                "diagnostic_id": f"WB-{source_hash[:12]}-CONTRACT",
+                "timestamp_utc": iso_now(),
+                "component": "Workbook parser",
+                "status": "failed",
+                "root_cause": {
+                    "code": "PARSER_OUTCOME_CONTRACT_MISSING",
+                    "summary": "The parser returned no diagnostic payload.",
+                    "recommended_action": f"Redeploy build {APP_VERSION}; the parser result contract is incomplete.",
+                },
+                "file": {
+                    "name": uploaded.name,
+                    "size_bytes": len(source_bytes),
+                    "sha256": source_hash,
+                },
+                "environment": runtime_environment_snapshot(),
+                "stages": [],
+            }
+        if not bool_value(outcome.get("ok") if isinstance(outcome, Mapping) else False):
+            render_workbook_parse_failure(diagnostics, source_hash)
+            return
+        parsed = parsed_workbook_from_payload(
+            outcome.get("workbook") if isinstance(outcome, Mapping) else None
         )
-        return
-    diagnostics = outcome.get("diagnostics") if isinstance(outcome, Mapping) else None
-    if not isinstance(diagnostics, Mapping):
-        diagnostics = {
-            "diagnostic_id": f"WB-{source_hash[:12]}-CONTRACT",
-            "timestamp_utc": iso_now(),
-            "component": "Workbook parser",
-            "status": "failed",
-            "root_cause": {
-                "code": "PARSER_OUTCOME_CONTRACT_MISSING",
-                "summary": "The parser returned no diagnostic payload.",
-                "recommended_action": f"Redeploy build {APP_VERSION}; the parser result contract is incomplete.",
-            },
-            "file": {"name": uploaded.name, "size_bytes": len(source_bytes), "sha256": source_hash},
-            "environment": runtime_environment_snapshot(),
-            "stages": [],
+        if parsed is None:
+            render_actionable_exception(
+                "Workbook payload reconstruction failed.",
+                RuntimeError(
+                    "Successful parser outcome could not be reconstructed from its plain-data payload."
+                ),
+                component="Workbook payload reconstruction",
+                context={
+                    "file_name": uploaded.name,
+                    "source_hash": source_hash,
+                    "diagnostics": diagnostics,
+                },
+            )
+            return
+        source_name = uploaded.name
+        source_kind = (
+            uploaded.name.rsplit(".", 1)[-1].upper()
+            if "." in uploaded.name
+            else "FILE"
+        )
+        source_metadata = {
+            "source_type": "file_upload",
+            "file_name": uploaded.name,
+            "mime_type": clean_text(getattr(uploaded, "type", "")),
+            "size_bytes": len(source_bytes),
         }
-    if not bool_value(outcome.get("ok") if isinstance(outcome, Mapping) else False):
-        render_workbook_parse_failure(diagnostics, source_hash)
-        return
-    parsed = parsed_workbook_from_payload(outcome.get("workbook") if isinstance(outcome, Mapping) else None)
-    if parsed is None:
-        render_actionable_exception(
-            "Workbook payload reconstruction failed.",
-            RuntimeError("Successful parser outcome could not be reconstructed from its plain-data payload."),
-            component="Workbook payload reconstruction",
-            context={"file_name": uploaded.name, "source_hash": source_hash, "diagnostics": diagnostics},
+        audit_action = "ingest_workbook"
+    else:
+        display_view = (
+            f"{TARGET_DATABASE}.{TARGET_SCHEMA}.{LIVE_PRODUCT_REQUEST_VIEW}"
         )
-        return
+        st.info(
+            f"OneEngine will snapshot **{display_view}** now. The snapshot enters the same normalization, validation, batch, and rule-execution path as an uploaded file."
+        )
+        refresh_live = st.button(
+            "Refresh live Product Request snapshot",
+            help="Discard the current preview snapshot and read the view again.",
+        )
+        snapshot_key = "_live_product_request_snapshot"
+        snapshot = st.session_state.get(snapshot_key)
+        if refresh_live:
+            snapshot = None
+            st.session_state.pop(snapshot_key, None)
+        valid_snapshot = (
+            isinstance(snapshot, Mapping)
+            and snapshot.get("payload_type") == "LiveProductRequestSnapshot"
+            and int(snapshot.get("payload_version") or 0) == 1
+            and clean_text(snapshot.get("source_view")) == display_view
+        )
+        if not valid_snapshot:
+            try:
+                with st.spinner("Reading live Product Request data from Snowflake…"):
+                    live_parsed, live_hash, live_metadata = (
+                        store.load_live_product_request_data()
+                    )
+                snapshot = {
+                    "payload_type": "LiveProductRequestSnapshot",
+                    "payload_version": 1,
+                    "source_view": display_view,
+                    "source_hash": live_hash,
+                    "workbook": parsed_workbook_to_payload(live_parsed),
+                    "metadata": _plain_data(live_metadata),
+                }
+                st.session_state[snapshot_key] = snapshot
+            except Exception as exc:
+                render_actionable_exception(
+                    "Live Product Request data could not be loaded.",
+                    exc,
+                    component="Snowflake live Product Request source",
+                    context={
+                        "source_view": display_view,
+                        "required_access": f"SELECT on {display_view}",
+                    },
+                )
+                return
+        parsed = parsed_workbook_from_payload(snapshot.get("workbook"))
+        source_hash = clean_text(snapshot.get("source_hash")).lower()
+        raw_metadata = snapshot.get("metadata")
+        if (
+            parsed is None
+            or not re.fullmatch(r"[a-f0-9]{64}", source_hash)
+            or not isinstance(raw_metadata, Mapping)
+        ):
+            st.session_state.pop(snapshot_key, None)
+            render_actionable_exception(
+                "The live Product Request snapshot could not be reconstructed.",
+                RuntimeError(
+                    "The session snapshot contract is incomplete; refresh the live snapshot."
+                ),
+                component="Snowflake live Product Request snapshot",
+                context={"source_view": display_view},
+            )
+            return
+        source_name = display_view
+        source_kind = "SNOWFLAKE_VIEW"
+        source_metadata = dict(raw_metadata)
+        initial_status = "Loaded"
+        audit_action = "ingest_live_product_request_view"
 
     known_columns = [column for column in parsed.columns if column in EXPECTED_HEADERS]
     required_missing = [column for column in ("Business", "Type") if column not in parsed.columns]
@@ -7887,11 +8132,20 @@ def render_process_workbook_page(store: SnowflakeRulesStore) -> None:
     metrics[0].metric("Rows", f"{len(parsed.rows):,}")
     metrics[1].metric("Columns", f"{len(parsed.columns):,}")
     metrics[2].metric("Recognized columns", f"{len(known_columns):,}")
-    metrics[3].metric("Worksheet", clean_text(parsed.sheet_name))
-    st.caption(
-        f"Parser PASS · Diagnostic {clean_text(diagnostics.get('diagnostic_id'))} · "
-        f"Upload SHA-256 {source_hash} · Build source {clean_text(source_code_fingerprint().get('sha256_short'))}"
+    metrics[3].metric(
+        "Source",
+        LIVE_PRODUCT_REQUEST_VIEW if is_live_source else clean_text(parsed.sheet_name),
     )
+    if is_live_source:
+        st.caption(
+            f"Live snapshot PASS · {source_name} · Snapshot SHA-256 {source_hash} · "
+            f"Captured {timestamp_text(source_metadata.get('snapshot_at'))[:19].replace('T', ' ')}"
+        )
+    else:
+        st.caption(
+            f"Parser PASS · Diagnostic {clean_text(diagnostics.get('diagnostic_id'))} · "
+            f"Upload SHA-256 {source_hash} · Build source {clean_text(source_code_fingerprint().get('sha256_short'))}"
+        )
     for warning in parsed.warnings:
         st.warning(warning)
     if required_missing:
@@ -7902,7 +8156,7 @@ def render_process_workbook_page(store: SnowflakeRulesStore) -> None:
     allow_duplicate = True
     if duplicate:
         st.warning(
-            f"This exact file content was already ingested as **{clean_text(duplicate.get('name'))}** on "
+            f"This exact source snapshot was already ingested as **{clean_text(duplicate.get('name'))}** on "
             f"{timestamp_text(duplicate.get('created_at'))[:19].replace('T', ' ')}."
         )
         allow_duplicate = st.checkbox("Ingest another copy intentionally", value=False)
@@ -7916,16 +8170,31 @@ def render_process_workbook_page(store: SnowflakeRulesStore) -> None:
             st.write(parsed.warnings)
         else:
             st.caption("No parser warnings.")
-    render_workbook_diagnostics(diagnostics, expanded=False)
+        if is_live_source:
+            st.json(_plain_data(source_metadata))
+    if diagnostics is not None:
+        render_workbook_diagnostics(diagnostics, expanded=False)
 
-    stem = uploaded.name.rsplit(".", 1)[0]
+    stem = (
+        f"Live Product Requests {date.today().isoformat()}"
+        if is_live_source
+        else source_name.rsplit(".", 1)[0]
+    )
     form_key = source_hash[:12]
     with st.form(f"ingest_form_{form_key}"):
         batch_name = st.text_input("Batch name", value=stem)
         include_reporting_date = st.checkbox("Set a reporting date", value=False)
         reporting_date = st.date_input("Reporting date", value=date.today(), disabled=not include_reporting_date)
         execute_immediately = st.checkbox("Execute all approved rules immediately after ingestion", value=False)
-        submitted = st.form_submit_button("Ingest workbook", type="primary", disabled=not allow_duplicate)
+        submitted = st.form_submit_button(
+            (
+                "Create batch from live Product Request data"
+                if is_live_source
+                else "Ingest workbook"
+            ),
+            type="primary",
+            disabled=not allow_duplicate,
+        )
     if submitted:
         try:
             batch, _ = store.create_batch(
@@ -7933,6 +8202,11 @@ def render_process_workbook_page(store: SnowflakeRulesStore) -> None:
                 source_bytes,
                 batch_name=batch_name,
                 reporting_date=reporting_date if include_reporting_date else None,
+                source_kind=source_kind,
+                source_sha256=source_hash if is_live_source else "",
+                source_metadata=source_metadata,
+                initial_status=initial_status,
+                audit_action=audit_action,
             )
             execution_message = ""
             if execute_immediately:
@@ -7940,15 +8214,18 @@ def render_process_workbook_page(store: SnowflakeRulesStore) -> None:
                 execution_message = f" Rules changed {int(result.run.get('changed_row_count') or 0):,} row(s)."
             st.session_state["selected_batch_id"] = batch["id"]
             st.session_state["_pending_batch_picker"] = batch["id"]
-            set_flash(f"Ingested {len(parsed.rows):,} rows into **{batch['name']}**.{execution_message}")
+            set_flash(
+                f"Ingested {len(parsed.rows):,} rows from **{source_name}** into **{batch['name']}**.{execution_message}"
+            )
             safe_rerun()
         except Exception as exc:
             render_actionable_exception(
-                "Workbook parsing succeeded, but Snowflake ingestion failed.",
+                "The Product Request source was prepared, but Snowflake ingestion failed.",
                 exc,
-                component="Workbook ingestion",
+                component="Product Request ingestion",
                 context={
-                    "file_name": uploaded.name,
+                    "source_name": source_name,
+                    "source_kind": source_kind,
                     "source_hash": source_hash,
                     "sheet_name": parsed.sheet_name,
                     "row_count": len(parsed.rows),

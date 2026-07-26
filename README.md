@@ -141,6 +141,24 @@ provisions the seven-table backend:
 The app performs no runtime DDL. Use **Settings → Verify backend tables** after
 deployment.
 
+### Live Product Request source
+
+**Process Workbook** offers two equivalent ingestion paths:
+
+- **Upload a file** for CSV, TSV, XLSX, or XLSM input.
+- **Use Live Product Request Data** to snapshot
+  `FOODBUY_MASALA_PROD.COMPLIANCE_LAB.V_OE_PRODUCTREQUESTS`.
+
+The live view is read directly through the active Snowflake session. Its rows
+use the same header normalization, preview, duplicate detection, persistent
+batch, audit, and optional immediate rules execution as uploaded files. Each
+snapshot receives a deterministic SHA-256 lineage value, so the exact source
+state can be identified and duplicate ingestion can be blocked or explicitly
+allowed.
+
+The Streamlit owner role needs `USAGE` on the database and schema plus `SELECT`
+on `V_OE_PRODUCTREQUESTS`. The app does not create, replace, or modify the view.
+
 ## Verification
 
 Run:
