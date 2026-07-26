@@ -98,8 +98,45 @@ class OneEngineContractTests(unittest.TestCase):
                 "results": "ROW_RESULTS",
                 "audit": "AUDIT_EVENTS",
                 "references": "REFERENCE_LISTS",
+                "catalog_versions": "CATALOG_VERSIONS",
+                "catalog_rules": "CATALOG_VERSION_RULES",
+                "distillery_gaps": "DISTILLERY_GAPS",
+                "outcome_aliases": "OUTCOME_ALIASES",
             },
             self.app.TABLE_SUFFIXES,
+        )
+
+    def test_literal_distillery_snowflake_contract(self) -> None:
+        source = APP_PATH.read_text(encoding="utf-8")
+        backend = (
+            ROOT / "snowflake" / "compliance_rules_backend.sql"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('"set_audit_action"', source)
+        self.assertIn('"audit_action"', source)
+        self.assertNotIn(
+            'context["' + "__evidence_hash" + '"]',
+            source,
+        )
+        for table in (
+            "COMPLIANCE_RULES_CATALOG_VERSIONS",
+            "COMPLIANCE_RULES_CATALOG_VERSION_RULES",
+            "COMPLIANCE_RULES_DISTILLERY_GAPS",
+            "COMPLIANCE_RULES_OUTCOME_ALIASES",
+        ):
+            self.assertIn(f"CREATE TABLE IF NOT EXISTS {self.app.TARGET_DATABASE}.{self.app.TARGET_SCHEMA}.{table}", backend)
+        self.assertIn(
+            "ADD COLUMN IF NOT EXISTS AUDIT_ACTION VARCHAR",
+            backend,
+        )
+        self.assertIn(
+            "Direct Distillery promotion is disabled",
+            source,
+        )
+        self.assertIn('"activate_catalog_version"', source)
+        self.assertIn(
+            '"rollback_catalog_version"',
+            source,
         )
 
     def test_live_product_request_source_contract(self) -> None:

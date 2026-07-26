@@ -22,6 +22,7 @@ import uuid
 import zipfile
 from collections import Counter, defaultdict, deque
 from contextlib import contextmanager
+from difflib import SequenceMatcher
 from importlib import metadata as importlib_metadata
 from time import perf_counter
 from copy import deepcopy
@@ -52,11 +53,13 @@ except Exception:  # Enables import-based engine tests outside Snowflake.
 
 
 APP_TITLE = "ONE ENGINE"
-APP_VERSION = "2026.07.26-one-engine-brand-shell-v5"
+APP_VERSION = "2026.07.26-one-engine-literal-distillery-v6"
 SESSION_STATE_SCHEMA_VERSION = 7
 WORKBOOK_PARSER_VERSION = "2026.07.24-v7-uncached"
 MAX_DIAGNOSTIC_EVENTS = 50
-DEPLOYMENT_SENTINEL = "ONE_ENGINE_FOODBUY_DESIGN_SYSTEM_BRAND_SHELL_20260726"
+DEPLOYMENT_SENTINEL = (
+    "ONE_ENGINE_FOODBUY_DESIGN_SYSTEM_LITERAL_FILTER_DISTILLERY_20260726"
+)
 LIVE_BUILD_BADGE = "ONE ENGINE · SNOWFLAKE · LIVE"
 FOODBUY_DESIGN_SYSTEM_REFERENCE = (
     "https://69925e4ee40e16a198c7c5cf-xdindjzhxi.chromatic.com/"
@@ -79,6 +82,10 @@ TABLE_SUFFIXES = {
     "results": "ROW_RESULTS",
     "audit": "AUDIT_EVENTS",
     "references": "REFERENCE_LISTS",
+    "catalog_versions": "CATALOG_VERSIONS",
+    "catalog_rules": "CATALOG_VERSION_RULES",
+    "distillery_gaps": "DISTILLERY_GAPS",
+    "outcome_aliases": "OUTCOME_ALIASES",
 }
 
 HEADER_ALIASES = {
@@ -99,6 +106,8 @@ HEADER_ALIASES = {
     "one time or permanent": "One-Time or Permanent",
     "conversion va pct": "Conversion VA%",
     "conversion va percent": "Conversion VA%",
+    "audit action": "Audit Action",
+    "auditaction": "Audit Action",
     "dstdin": "DSTDIN",
 }
 
@@ -133,6 +142,7 @@ EXPECTED_HEADERS = [
     "Conversion VA%",
     "ACTION",
     "If In Stock: Action",
+    "Audit Action",
     "Buysmart Action",
 ]
 EXPECTED_HEADER_LOOKUP = {header.lower(): header for header in EXPECTED_HEADERS}
@@ -179,6 +189,7 @@ FIELD_LABELS = {
     "has_conversion": "Has conversion DIN",
     "is_levy": "Levy",
     "is_schools": "Schools/Chartwells",
+    "date_created": "Date created",
 }
 
 OPERATOR_LABELS = {
@@ -200,16 +211,27 @@ OPERATOR_LABELS = {
     "not_in_ref": "is not in reference list",
     "regex": "matches regex",
     "not_regex": "does not match regex",
+    "date_before": "is before",
+    "date_on_or_before": "is on or before",
+    "date_after": "is after",
+    "date_on_or_after": "is on or after",
 }
 SUPPORTED_OPERATORS = set(OPERATOR_LABELS)
 NO_VALUE_OPERATORS = {"blank", "not_blank", "is_true", "is_false"}
 NUMERIC_OPERATORS = {"gt", "ge", "lt", "le"}
+DATE_OPERATORS = {
+    "date_before",
+    "date_on_or_before",
+    "date_after",
+    "date_on_or_after",
+}
 LIST_OPERATORS = {"in", "not_in"}
 
 ACTION_LABELS = {
     "set_action": "Set ACTION",
     "set_action_by_duration": "Set ACTION by duration",
     "set_if_stock": "Set If In Stock",
+    "set_audit_action": "Set Audit Action",
     "set_buysmart": "Set BuySmart",
     "set_review": "Flag for review",
     "append_validation": "Add validation",
@@ -221,6 +243,7 @@ ACTION_LABELS = {
 USER_ACTION_TYPES = [
     "set_action",
     "set_if_stock",
+    "set_audit_action",
     "set_buysmart",
     "set_review",
     "append_validation",
@@ -230,6 +253,14 @@ USER_ACTION_TYPES = [
 
 ACTION_OPTIONS = ["OK", "1X", "Use Right", "Find Alt First", "Cannot Add", "Invalid Information", "Review"]
 IF_STOCK_OPTIONS = ["OK", "Review"]
+AUDIT_ACTION_OPTIONS = [
+    "DAOG",
+    "SRF",
+    "REPLACE",
+    "KEEP AND DAOG",
+    "KEEP AND SRF",
+    "KEEP AND REPLACE",
+]
 BUYSMART_OPTIONS = ["Approved", "Denied", "Assigned", "Review"]
 
 RUNTIME_KIND_ORDER = {
@@ -326,6 +357,7 @@ EXPORT_HEADERS = [
     "Description",
     "ACTION",
     "If In Stock: Action",
+    "Audit Action",
     "Buysmart Action",
     "Assigned Bucket",
     "Rule Applied",
@@ -361,6 +393,7 @@ APPLIED_RULE_HEADERS = [
     "Matched At",
     "Final ACTION",
     "Final If In Stock: Action",
+    "Final Audit Action",
     "Final Buysmart Action",
     "Compliance Bucket",
     "Outcome Reporting",
@@ -828,6 +861,7 @@ def create_normalized_row(raw_row: Mapping[str, Any]) -> dict[str, Any]:
         "conversionVaPct": percent_value(source.get("Conversion VA%")),
         "upstreamAction": normalize_action(source.get("ACTION")),
         "upstreamIfInStockAction": normalize_action(source.get("If In Stock: Action")),
+        "upstreamAuditAction": clean_text(source.get("Audit Action")),
         "upstreamBuysmartAction": normalize_action(source.get("Buysmart Action")),
     }
 
@@ -904,6 +938,7 @@ def create_workflow_row(
     fields = normalized["fields"]
     upstream_action = clean_text(fields["upstreamAction"])
     upstream_if_stock = clean_text(fields["upstreamIfInStockAction"])
+    upstream_audit_action = clean_text(fields["upstreamAuditAction"])
     request_type = clean_text(fields["requestType"])
     case_number = clean_text(fields["caseNumber"])
     row: dict[str, Any] = {
@@ -944,8 +979,10 @@ def create_workflow_row(
         "conversion_va_pct": fields["conversionVaPct"],
         "upstream_action": upstream_action,
         "upstream_if_in_stock_action": upstream_if_stock,
+        "upstream_audit_action": upstream_audit_action,
         "action": upstream_action,
         "if_in_stock_action": upstream_if_stock,
+        "audit_action": upstream_audit_action,
         "buysmart_action": clean_text(fields["upstreamBuysmartAction"]),
         "rule_applied": "",
         "execution_trace": [],
@@ -973,6 +1010,7 @@ def refresh_derived(row: MutableMapping[str, Any]) -> MutableMapping[str, Any]:
     source = deepcopy(row.get("raw_row") or {})
     source["ACTION"] = row.get("upstream_action", "")
     source["If In Stock: Action"] = row.get("upstream_if_in_stock_action", "")
+    source["Audit Action"] = row.get("upstream_audit_action", "")
     source["Buysmart Action"] = row.get("buysmart_action", "")
     normalized = create_normalized_row(source)
     normalized["derived"]["current_action_key"] = normalize_key(row.get("action"))
@@ -1050,6 +1088,10 @@ def context_for_row(row: Mapping[str, Any]) -> dict[str, Any]:
         "If In Stock: Action",
         row.get("upstream_if_in_stock_action"),
     )
+    context["input_audit_action"] = raw_row.get(
+        "Audit Action",
+        row.get("upstream_audit_action"),
+    )
     context["input_buysmart_action"] = raw_row.get(
         "Buysmart Action",
         row.get("buysmart_action"),
@@ -1057,13 +1099,13 @@ def context_for_row(row: Mapping[str, Any]) -> dict[str, Any]:
     context["conversion_va_num"] = _distillery_number(
         context.get("conversion_va")
     )
-    context["__evidence_hash"] = _distillery_evidence_hash(raw_row)
     context["__ruleset_id"] = clean_text(
         row.get("ruleset_id") or "product_request"
     )
     context["current_action_key"] = normalize_key(row.get("action"))
     context["current_buysmart_key"] = normalize_key(row.get("buysmart_action"))
     context["action"] = clean_text(row.get("action"))
+    context["audit_action"] = clean_text(row.get("audit_action"))
     context["buysmartAction"] = clean_text(row.get("buysmart_action"))
     return context
 
@@ -1071,6 +1113,19 @@ def context_for_row(row: Mapping[str, Any]) -> dict[str, Any]:
 def _number_for_compare(value: Any) -> float:
     parsed = parse_number(value)
     return parsed if parsed is not None else 0.0
+
+
+def _date_for_compare(value: Any) -> datetime | None:
+    normalized = normalize_date(value)
+    if not normalized:
+        return None
+    try:
+        parsed = datetime.fromisoformat(normalized.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 _IN_LIST_CACHE: dict[int, tuple[Any, frozenset[str]]] = {}
@@ -1136,6 +1191,18 @@ def evaluate_predicate(
         return _number_for_compare(left) < _number_for_compare(right)
     if op == "le":
         return _number_for_compare(left) <= _number_for_compare(right)
+    if op in DATE_OPERATORS:
+        left_date = _date_for_compare(left)
+        right_date = _date_for_compare(right)
+        if left_date is None or right_date is None:
+            return False
+        if op == "date_before":
+            return left_date < right_date
+        if op == "date_on_or_before":
+            return left_date <= right_date
+        if op == "date_after":
+            return left_date > right_date
+        return left_date >= right_date
     if op == "in":
         return _in_list(left, right)
     if op == "not_in":
@@ -1186,6 +1253,8 @@ def apply_actions(
             row["action"] = "1X" if "one" in duration or "seasonal" in duration else "OK"
         elif action_type == "set_if_stock":
             row["if_in_stock_action"] = normalize_action(node.get("value"))
+        elif action_type == "set_audit_action":
+            row["audit_action"] = clean_text(node.get("value"))
         elif action_type == "set_buysmart":
             row["buysmart_action"] = normalize_action(node.get("value"))
         elif action_type == "set_review":
@@ -1299,6 +1368,7 @@ def decision_snapshot(row: Mapping[str, Any]) -> str:
         [
             clean_text(row.get("action")),
             clean_text(row.get("if_in_stock_action")),
+            clean_text(row.get("audit_action")),
             clean_text(row.get("buysmart_action")),
             str(bool_value(row.get("needs_review"))),
             str(bool_value(row.get("excluded"))),
@@ -1486,7 +1556,7 @@ def summarize_batch(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
 
 def catalog_snapshot(rules: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     ordered = executable_variants(rules)
-    return {
+    snapshot = {
         "ruleCount": len(rules),
         "variantCount": sum(len(rule.get("variants") or []) for rule in rules),
         "executionOrder": [
@@ -1501,6 +1571,19 @@ def catalog_snapshot(rules: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         ],
         "capturedAt": iso_now(),
     }
+    snapshot["sha256"] = hashlib.sha256(
+        json.dumps(
+            {
+                "rules": [_plain_data(rule) for rule in rules],
+                "executionOrder": snapshot["executionOrder"],
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=json_default,
+        ).encode("utf-8")
+    ).hexdigest()
+    return snapshot
 
 
 def field_pred(field: str, op: str, value: Any = None) -> dict[str, Any]:
@@ -2075,6 +2158,11 @@ def normalize_filter_value(operator: str, value: Any) -> Any:
         if parsed is None:
             raise ValueError("Numeric filter operators require a numeric value.")
         return parsed
+    if operator in DATE_OPERATORS:
+        parsed = normalize_date(value)
+        if _date_for_compare(parsed) is None:
+            raise ValueError("Date filter operators require a valid date.")
+        return parsed
     if operator in LIST_OPERATORS:
         items = [item.strip() for item in clean_text(value).split(",") if item.strip()]
         if not items:
@@ -2126,8 +2214,20 @@ def action_json_from_rows(action_rows: Sequence[Mapping[str, Any]]) -> list[dict
             actions.append({"type": "exclude", "reason": reason or "User-managed exclusion rule"})
         elif action_type == "set_review":
             actions.append({"type": "set_review", "value": True})
-        elif action_type in {"set_action", "set_if_stock", "set_buysmart", "append_validation", "add_note"}:
-            if not value:
+        elif action_type in {
+            "set_action",
+            "set_if_stock",
+            "set_audit_action",
+            "set_buysmart",
+            "append_validation",
+            "add_note",
+        }:
+            permits_blank = action_type in {
+                "set_action",
+                "set_if_stock",
+                "set_audit_action",
+            }
+            if not value and not (permits_blank and "value" in action_row):
                 raise ValueError(f"{ACTION_LABELS[action_type]} requires a value.")
             actions.append({"type": action_type, "value": value})
     if not actions:
@@ -2170,6 +2270,8 @@ def aggregate_logic_text(actions: Sequence[Mapping[str, Any]]) -> str:
             parts.append(f"Set ACTION: {value}")
         elif action_type == "set_if_stock":
             parts.append(f"Set If In Stock: {value}")
+        elif action_type == "set_audit_action":
+            parts.append(f"Set Audit Action: {value}")
         elif action_type == "set_buysmart":
             parts.append(f"Set BuySmart: {value}")
         else:
@@ -2284,9 +2386,17 @@ def validate_action_definition(actions: Sequence[Mapping[str, Any]]) -> None:
                 raise ValueError(f"Action {index} when clause must be a predicate object.")
             validate_predicate_definition(when)
         if action_type in {
-            "set_action", "set_if_stock", "set_buysmart", "append_validation",
-            "add_note", "preserve_action_set_if_stock"
-        } and not clean_text(node.get("value")):
+            "set_action",
+            "set_if_stock",
+            "set_audit_action",
+            "set_buysmart",
+            "append_validation",
+            "add_note",
+            "preserve_action_set_if_stock",
+        } and not clean_text(node.get("value")) and not (
+            action_type in {"set_action", "set_if_stock", "set_audit_action"}
+            and "value" in node
+        ):
             raise ValueError(f"{ACTION_LABELS[action_type]} requires a value.")
         if action_type == "clear_field" and clean_text(node.get("field")) != "Conversion DIN":
             raise ValueError("Clear field currently supports only Conversion DIN.")
@@ -2466,6 +2576,15 @@ def set_rule_enabled(rule: Mapping[str, Any], enabled: bool) -> dict[str, Any]:
 
 def is_bundled_rule(rule: Mapping[str, Any]) -> bool:
     return bool_value(rule.get("is_bundled")) or bool(re.fullmatch(r"R\d+", clean_text(rule.get("rule_id")), re.I))
+
+
+def rule_workflow_id(rule: Mapping[str, Any]) -> str:
+    source = rule.get("source") if isinstance(rule.get("source"), Mapping) else {}
+    return (
+        clean_text(rule.get("ruleset_id"))
+        or clean_text(source.get("ruleset_id"))
+        or "product_request"
+    )
 
 
 def predicate_is_simple(predicate: Any) -> bool:
@@ -2787,7 +2906,7 @@ def parse_source_workbook(file_name: str, data: bytes) -> ParsedWorkbook:
 # -----------------------------------------------------------------------------
 
 
-DISTILLERY_VERSION = "2026.07.26-single-file-v1"
+DISTILLERY_VERSION = "2026.07.26-literal-filter-v2"
 DISTILLERY_SUPPORTED_EXTENSIONS = {
     "csv",
     "tsv",
@@ -2821,7 +2940,7 @@ DISTILLERY_STOP_WORDS = {
 
 PRODUCT_REQUEST_DISTILLERY_PROFILE: dict[str, Any] = {
     "profile_id": "product_request",
-    "version": "1.1.0",
+    "version": "2.0.0",
     "description": "Product Request PRF/SORF/SRF daily decision sources",
     "output_fields": [
         {
@@ -2836,6 +2955,12 @@ PRODUCT_REQUEST_DISTILLERY_PROFILE: dict[str, Any] = {
             "action_type": "set_if_stock",
             "normalizer": "action",
         },
+        {
+            "source": "Audit Action",
+            "target": "audit_action",
+            "action_type": "set_audit_action",
+            "normalizer": "audit",
+        },
     ],
     "column_aliases": {
         "Case": "Case#",
@@ -2844,6 +2969,7 @@ PRODUCT_REQUEST_DISTILLERY_PROFILE: dict[str, Any] = {
         "Buy Smart Action": "Buysmart Action",
         "If In-Stock Action": "If In Stock: Action",
         "If In Stock Action": "If In Stock: Action",
+        "AuditAction": "Audit Action",
     },
     "matching": {
         "identity_groups": [
@@ -2916,13 +3042,13 @@ PRODUCT_REQUEST_DISTILLERY_PROFILE: dict[str, Any] = {
             "conversion_brand",
             "conversion_item_description",
             "conversion_va",
-            "audit_action",
             "supply_chain_description",
             "pack",
             "parent",
             "dst",
             "input_action",
             "input_if_in_stock_action",
+            "input_audit_action",
             "input_buysmart_action",
             "business_key",
             "request_type_key",
@@ -2949,6 +3075,9 @@ PRODUCT_REQUEST_DISTILLERY_PROFILE: dict[str, Any] = {
             "meets_criteria_num",
             "conversion_va_num",
         ],
+        "date_fields": [
+            "date_created",
+        ],
         "token_fields": [
             "vendor",
             "manufacturer",
@@ -2973,12 +3102,79 @@ PRODUCT_REQUEST_DISTILLERY_PROFILE: dict[str, Any] = {
         "maximum_category_splits": 16,
         "maximum_numeric_splits": 16,
         "maximum_token_splits": 24,
+        "literal_maximum_category_splits": 128,
+        "literal_maximum_token_splits": 64,
+        "maximum_in_list_size": 64,
+        "minimum_negated_category_support": 3,
         "minimum_token_support": 5,
         "minimum_general_support": 3,
-        "exception_identity_groups": [
-            ["case"],
-            ["unit_number", "din", "min", "vendor"],
-            ["business", "type", "din", "min", "description"],
+        "minimum_auto_support_dates": 2,
+        "maximum_filter_depth": 4,
+        "maximum_greedy_filter_depth": 8,
+        "filter_beam_width": 32,
+        "maximum_atoms_per_outcome": 32,
+        "maximum_filters_per_outcome": 16,
+        "governed_fields": [
+            "business",
+            "type",
+            "sector",
+            "division",
+            "vendor",
+            "manufacturer",
+            "brand",
+            "description",
+            "parent_category",
+            "sub_category",
+            "usage",
+            "one_time_or_permanent",
+            "reason_for_request",
+            "dpl",
+            "meets_criteria",
+            "in_cat",
+            "on_mog",
+            "pantry",
+            "k12_apl",
+            "compass_apl",
+            "conversion_din",
+            "conversion_manufacturer",
+            "conversion_brand",
+            "conversion_item_description",
+            "conversion_va",
+            "supply_chain_description",
+            "pack",
+            "parent",
+            "dst",
+            "input_action",
+            "input_if_in_stock_action",
+            "input_audit_action",
+            "date_created",
+            "business_key",
+            "request_type_key",
+            "usage_num",
+            "meets_criteria_num",
+            "conversion_va_num",
+            "is_one_time",
+            "is_permanent",
+            "is_in_catalog",
+            "is_in_cat_y",
+            "is_temp_available",
+            "is_pantry",
+            "is_k12_apl",
+            "is_core_apl",
+            "is_s1",
+            "is_foh",
+            "is_diverse",
+            "has_conversion",
+            "is_levy",
+            "is_schools",
+        ],
+        "prohibited_predicate_fields": [
+            "__evidence_hash",
+            "case",
+            "case_number",
+            "case_",
+            "pair_id",
+            "workflow_request_key",
         ],
     },
     "feature_projector": "product_request",
@@ -3101,6 +3297,113 @@ def distillery_action(value: Any) -> str:
         "BLANK": "",
     }
     return aliases.get(normalize_key(text), text)
+
+
+def distillery_outcome_value(
+    target: str,
+    value: Any,
+    aliases: Mapping[str, Mapping[str, Any]] | None = None,
+) -> str:
+    """Canonicalize one literal AFTER outcome without fuzzy guessing."""
+    raw = clean_text(value)
+    key = normalize_key(raw)
+    field_aliases = (aliases or {}).get(clean_text(target)) or {}
+    explicit = field_aliases.get(key)
+    if explicit is None and raw in field_aliases:
+        explicit = field_aliases.get(raw)
+    if explicit is not None:
+        return clean_text(explicit)
+    if clean_text(target) in {"action", "if_in_stock_action"}:
+        return distillery_action(raw)
+    if clean_text(target) == "audit_action":
+        known = {
+            "DAOG": "DAOG",
+            "SRF": "SRF",
+            "REPLACE": "REPLACE",
+            "KEEP AND DAOG": "KEEP AND DAOG",
+            "KEEP AND SRF": "KEEP AND SRF",
+            "KEEP AND REPLACE": "KEEP AND REPLACE",
+        }
+        return known.get(key, raw)
+    return raw
+
+
+def distillery_outcome_alias_registry(
+    after_documents: Sequence[Mapping[str, Any]],
+    profile: Mapping[str, Any],
+    aliases: Mapping[str, Mapping[str, Any]] | None = None,
+    approved_keys: Sequence[str] | None = None,
+) -> dict[str, Any]:
+    """Inventory raw outcomes, safe aliases, and review-only fuzzy suggestions."""
+    approved = {clean_text(value) for value in (approved_keys or [])}
+    approve_all = "*" in approved
+    entries: list[dict[str, Any]] = []
+    suggestions: list[dict[str, Any]] = []
+    by_target: dict[str, Counter[str]] = defaultdict(Counter)
+    raw_display: dict[tuple[str, str], str] = {}
+    contracts = profile.get("output_fields") or []
+    for document in after_documents:
+        for row in document.get("rows") or []:
+            for contract in contracts:
+                source = clean_text(contract.get("source"))
+                target = clean_text(contract.get("target"))
+                raw = clean_text(row.get(source))
+                raw_key = normalize_key(raw)
+                by_target[target][raw_key] += 1
+                raw_display.setdefault((target, raw_key), raw)
+    for target, counts in sorted(by_target.items()):
+        for raw_key, count in counts.most_common():
+            raw = raw_display[(target, raw_key)]
+            canonical = distillery_outcome_value(target, raw, aliases)
+            entry_key = f"{target}|{raw_key}"
+            entries.append(
+                {
+                    "field_name": target,
+                    "raw_value": raw,
+                    "raw_key": raw_key,
+                    "canonical_value": canonical,
+                    "row_count": int(count),
+                    "status": (
+                        "approved"
+                        if entry_key in approved
+                        or (aliases or {}).get(target, {}).get(raw_key) is not None
+                        else "automatic"
+                    ),
+                }
+            )
+        non_blank = [key for key in counts if key]
+        for left_index, left in enumerate(non_blank):
+            for right in non_blank[left_index + 1 :]:
+                if left == right:
+                    continue
+                stored = (aliases or {}).get(target, {})
+                if left in stored and right in stored:
+                    # Both raw values were explicitly reviewed. They may
+                    # intentionally stay distinct or map to one canonical
+                    # value; either choice is persisted in Snowflake.
+                    continue
+                similarity = SequenceMatcher(None, left, right).ratio()
+                if similarity < 0.9:
+                    continue
+                review_key = f"{target}|{left}|{right}"
+                if approve_all or review_key in approved:
+                    continue
+                suggestions.append(
+                    {
+                        "review_key": review_key,
+                        "field_name": target,
+                        "left_value": raw_display[(target, left)],
+                        "right_value": raw_display[(target, right)],
+                        "similarity": round(similarity, 4),
+                        "status": "review",
+                    }
+                )
+    return {
+        "entries": entries,
+        "suggestions": suggestions,
+        "review_required": len(suggestions),
+        "raw_value_count": len(entries),
+    }
 
 
 def distillery_evidence_hash(row: Mapping[str, Any]) -> str:
@@ -3299,13 +3602,15 @@ def distillery_similarity(
 def distillery_outputs(
     after: Mapping[str, Any],
     profile: Mapping[str, Any],
+    aliases: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     output: dict[str, Any] = {}
     for contract in profile.get("output_fields") or []:
         value = after.get(contract.get("source"))
-        output[clean_text(contract.get("target"))] = (
-            distillery_action(value)
-            if clean_text(contract.get("normalizer")) == "action"
+        target = clean_text(contract.get("target"))
+        output[target] = (
+            distillery_outcome_value(target, value, aliases)
+            if clean_text(contract.get("normalizer")) in {"action", "audit"}
             else clean_text(value)
         )
     return output
@@ -3320,6 +3625,7 @@ def distillery_make_pair(
     method: str,
     score: float,
     ambiguous: bool = False,
+    outcome_aliases: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> DistilleryPair:
     before = before_document["rows"][before_index]
     after = after_document["rows"][after_index]
@@ -3349,7 +3655,7 @@ def distillery_make_pair(
         after_index=after_index,
         before=before,
         after=after,
-        outputs=distillery_outputs(after, profile),
+        outputs=distillery_outputs(after, profile, outcome_aliases),
         method=method,
         score=score,
         ambiguous=ambiguous,
@@ -3361,6 +3667,7 @@ def distillery_match_document_pair(
     before_document: Mapping[str, Any],
     after_document: Mapping[str, Any],
     profile: Mapping[str, Any],
+    outcome_aliases: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> tuple[list[DistilleryPair], list[dict[str, Any]]]:
     before_rows = before_document["rows"]
     after_rows = after_document["rows"]
@@ -3415,6 +3722,7 @@ def distillery_match_document_pair(
                     profile,
                     "exact_payload",
                     1.0,
+                    outcome_aliases=outcome_aliases,
                 )
             )
     for identity_fields in matching.get("identity_groups") or []:
@@ -3448,6 +3756,7 @@ def distillery_match_document_pair(
                     profile,
                     "unique_identity",
                     0.98,
+                    outcome_aliases=outcome_aliases,
                 )
             )
     similarity_fields = matching.get("similarity_fields") or all_fields
@@ -3498,6 +3807,7 @@ def distillery_match_document_pair(
                 "similarity",
                 score,
                 ambiguous=margin < ambiguity_margin,
+                outcome_aliases=outcome_aliases,
             )
         )
     unmatched = [
@@ -3523,6 +3833,7 @@ def distillery_match_documents(
     before_documents: Sequence[Mapping[str, Any]],
     after_documents: Sequence[Mapping[str, Any]],
     profile: Mapping[str, Any],
+    outcome_aliases: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> tuple[tuple[DistilleryPair, ...], tuple[dict[str, Any], ...]]:
     def index(
         documents: Sequence[Mapping[str, Any]],
@@ -3552,6 +3863,7 @@ def distillery_match_documents(
             before_by_group[group],
             after_by_group[group],
             profile,
+            outcome_aliases,
         )
         pairs.extend(group_pairs)
         unmatched.extend(group_unmatched)
@@ -3564,6 +3876,7 @@ def distillery_product_request_features(
     values = {distillery_field(key): value for key, value in row.items()}
     values["input_action"] = values.get("action")
     values["input_if_in_stock_action"] = values.get("if_in_stock_action")
+    values["input_audit_action"] = values.get("audit_action")
     values["input_buysmart_action"] = values.get("buysmart_action")
     business = clean_text(values.get("business"))
     request_type = clean_text(values.get("type"))
@@ -3673,6 +3986,18 @@ def distillery_evaluate_atom(
         return clean_text(right).lower() in clean_text(left).lower()
     if operator == "not_contains":
         return clean_text(right).lower() not in clean_text(left).lower()
+    if operator in DATE_OPERATORS:
+        left_date = _date_for_compare(left)
+        right_date = _date_for_compare(right)
+        if left_date is None or right_date is None:
+            return False
+        if operator == "date_before":
+            return left_date < right_date
+        if operator == "date_on_or_before":
+            return left_date <= right_date
+        if operator == "date_after":
+            return left_date > right_date
+        return left_date >= right_date
     left_number = distillery_number(left)
     right_number = distillery_number(right)
     if left_number is None or right_number is None:
@@ -3702,6 +4027,10 @@ def distillery_inverse_atom(atom: DistilleryAtom) -> DistilleryAtom:
         "lt": "ge",
         "gt": "le",
         "le": "gt",
+        "date_before": "date_on_or_after",
+        "date_on_or_after": "date_before",
+        "date_after": "date_on_or_before",
+        "date_on_or_before": "date_after",
     }
     return DistilleryAtom(atom.field, inverse[atom.operator], atom.value)
 
@@ -3744,14 +4073,21 @@ class SingleFileRuleInducer:
             dict[tuple[str, ...], frozenset[tuple[tuple[str, Any], ...]]],
         ] = {}
         self.normalized_values: dict[str, tuple[str, ...]] = {}
+        self.normalized_indexes: dict[
+            str,
+            dict[str, frozenset[int]],
+        ] = {}
         self.lower_values: dict[str, tuple[str, ...]] = {}
         self.numeric_values: dict[str, tuple[float | None, ...]] = {}
+        self.date_values: dict[str, tuple[datetime | None, ...]] = {}
         self.token_values: dict[str, tuple[frozenset[str], ...]] = {}
         self.candidate_matrix: Any = None
         self.label_codes: Any = None
         self.label_count = 0
+        self.universe_indexes: frozenset[int] = frozenset()
 
     def prepare_feature_caches(self) -> None:
+        self.universe_indexes = frozenset(range(len(self.rows)))
         fields = {
             field
             for field in self.config.get("feature_fields") or []
@@ -3763,18 +4099,30 @@ class SingleFileRuleInducer:
             for field in group
         )
         numeric_fields = set(self.config.get("numeric_fields") or [])
+        date_fields = set(self.config.get("date_fields") or [])
         token_fields = set(self.config.get("token_fields") or [])
         for field in fields:
             values = tuple(row.features.get(field) for row in self.rows)
             self.normalized_values[field] = tuple(
                 normalize_key(value) for value in values
             )
+            field_indexes: dict[str, set[int]] = defaultdict(set)
+            for index, value in enumerate(self.normalized_values[field]):
+                field_indexes[value].add(index)
+            self.normalized_indexes[field] = {
+                value: frozenset(indexes)
+                for value, indexes in field_indexes.items()
+            }
             self.lower_values[field] = tuple(
                 clean_text(value).lower() for value in values
             )
             if field in numeric_fields:
                 self.numeric_values[field] = tuple(
                     distillery_number(value) for value in values
+                )
+            if field in date_fields:
+                self.date_values[field] = tuple(
+                    _date_for_compare(value) for value in values
                 )
             if field in token_fields:
                 self.token_values[field] = tuple(
@@ -3786,12 +4134,40 @@ class SingleFileRuleInducer:
         indices: Sequence[int],
     ) -> Iterable[DistilleryAtom]:
         numeric_fields = set(self.config.get("numeric_fields") or [])
+        date_fields = set(self.config.get("date_fields") or [])
         token_fields = set(self.config.get("token_fields") or [])
         for field in self.config.get("feature_fields") or []:
             if field == "*":
                 continue
             values = [self.rows[index].features.get(field) for index in indices]
             normalized_values = self.normalized_values[field]
+            if field in date_fields:
+                dates = sorted(
+                    {
+                        value
+                        for index in indices
+                        if (value := self.date_values[field][index])
+                        is not None
+                    }
+                )
+                for threshold in distillery_sample(
+                    dates[1:],
+                    int(self.config.get("maximum_date_splits", 16)),
+                ):
+                    value = threshold.date().isoformat()
+                    yield DistilleryAtom(
+                        field,
+                        "date_on_or_after",
+                        value,
+                    )
+                    yield DistilleryAtom(field, "date_before", value)
+                if any(
+                    value is None or not clean_text(value)
+                    for value in values
+                ):
+                    yield DistilleryAtom(field, "blank")
+                    yield DistilleryAtom(field, "not_blank")
+                continue
             if field in numeric_fields:
                 numbers = sorted(
                     {
@@ -3813,10 +4189,12 @@ class SingleFileRuleInducer:
                         int(self.config.get("maximum_numeric_splits", 16)),
                     ):
                         yield DistilleryAtom(field, "ge", threshold)
+                        yield DistilleryAtom(field, "lt", threshold)
                 if any(
                     value is None or not clean_text(value) for value in values
                 ):
                     yield DistilleryAtom(field, "blank")
+                    yield DistilleryAtom(field, "not_blank")
                 continue
             non_blank_indices = [
                 index for index in indices if normalized_values[index]
@@ -3827,10 +4205,12 @@ class SingleFileRuleInducer:
             ]
             if len(non_blank_indices) < len(indices) and non_blank:
                 yield DistilleryAtom(field, "blank")
+                yield DistilleryAtom(field, "not_blank")
             if not non_blank:
                 continue
             if all(isinstance(value, bool) for value in non_blank):
                 yield DistilleryAtom(field, "is_true")
+                yield DistilleryAtom(field, "is_false")
                 continue
             counts = Counter(
                 normalized_values[index] for index in non_blank_indices
@@ -3862,7 +4242,9 @@ class SingleFileRuleInducer:
             for value, label_counts in labels_by_value.items():
                 grouped[label_counts.most_common(1)[0][0]].append(value)
             for grouped_values in grouped.values():
-                if 1 < len(grouped_values) <= maximum_categories:
+                if 1 < len(grouped_values) <= int(
+                    self.config.get("maximum_in_list_size", 64)
+                ):
                     ordered = sorted(
                         grouped_values,
                         key=lambda value: counts[value],
@@ -3899,12 +4281,15 @@ class SingleFileRuleInducer:
             "not_blank",
         }:
             values = self.normalized_values[field]
-            universe = set(range(len(values)))
+            universe = self.universe_indexes
             if operator in {"eq", "ne"}:
                 target = normalize_key(atom.value)
-                matched = {
-                    index for index, value in enumerate(values) if value == target
-                }
+                matched = set(
+                    self.normalized_indexes[field].get(
+                        target,
+                        frozenset(),
+                    )
+                )
                 return frozenset(
                     matched if operator == "eq" else universe - matched
                 )
@@ -3915,13 +4300,20 @@ class SingleFileRuleInducer:
                     else [atom.value]
                 )
                 targets = {normalize_key(value) for value in options}
-                matched = {
-                    index for index, value in enumerate(values) if value in targets
-                }
+                matched: set[int] = set()
+                for target in targets:
+                    matched.update(
+                        self.normalized_indexes[field].get(
+                            target,
+                            frozenset(),
+                        )
+                    )
                 return frozenset(
                     matched if operator == "in" else universe - matched
                 )
-            matched = {index for index, value in enumerate(values) if not value}
+            matched = set(
+                self.normalized_indexes[field].get("", frozenset())
+            )
             return frozenset(
                 matched if operator == "blank" else universe - matched
             )
@@ -3931,7 +4323,7 @@ class SingleFileRuleInducer:
                 for index, row in enumerate(self.rows)
                 if bool(row.features.get(field))
             }
-            universe = set(range(len(self.rows)))
+            universe = self.universe_indexes
             return frozenset(
                 matched if operator == "is_true" else universe - matched
             )
@@ -3942,9 +4334,25 @@ class SingleFileRuleInducer:
                 for index, value in enumerate(self.lower_values[field])
                 if target in value
             }
-            universe = set(range(len(self.rows)))
+            universe = self.universe_indexes
             return frozenset(
                 matched if operator == "contains" else universe - matched
+            )
+        if operator in DATE_OPERATORS:
+            target_date = _date_for_compare(atom.value)
+            if target_date is None:
+                return frozenset()
+            comparisons = {
+                "date_before": lambda value: value < target_date,
+                "date_on_or_before": lambda value: value <= target_date,
+                "date_after": lambda value: value > target_date,
+                "date_on_or_after": lambda value: value >= target_date,
+            }
+            comparator = comparisons[operator]
+            return frozenset(
+                index
+                for index, value in enumerate(self.date_values[field])
+                if value is not None and comparator(value)
             )
         target = distillery_number(atom.value)
         if target is None:
@@ -4311,9 +4719,937 @@ class SingleFileRuleInducer:
         )
 
 
+def literal_atom_signature(atom: DistilleryAtom) -> tuple[str, str, str]:
+    value = atom.value
+    if isinstance(value, (list, tuple, set)):
+        normalized = sorted(normalize_key(item) for item in value)
+        value_signature = json.dumps(normalized, separators=(",", ":"))
+    else:
+        value_signature = normalize_key(value)
+    return atom.field, atom.operator, value_signature
+
+
+def literal_logic_signature(
+    predicates: Sequence[DistilleryAtom],
+    outputs: Mapping[str, Any] | Sequence[tuple[str, Any]],
+) -> str:
+    label = dict(outputs)
+    payload = {
+        "predicates": [
+            {
+                "field": atom.field,
+                "op": atom.operator,
+                "value": (
+                    sorted(
+                        [clean_text(value) for value in atom.value],
+                        key=normalize_key,
+                    )
+                    if isinstance(atom.value, (list, tuple, set))
+                    else _plain_data(atom.value)
+                ),
+            }
+            for atom in sorted(predicates, key=literal_atom_signature)
+        ],
+        "outputs": {
+            key: clean_text(value) for key, value in sorted(label.items())
+        },
+    }
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def literal_filter_name(
+    profile_id: str,
+    predicates: Sequence[DistilleryAtom],
+    outputs: Mapping[str, Any],
+) -> str:
+    profile_name = clean_text(profile_id).replace("_", " ").title()
+    filter_parts: list[str] = []
+    for atom in predicates[:4]:
+        label = FIELD_LABELS.get(atom.field, atom.field.replace("_", " ").title())
+        if atom.operator in {"blank", "not_blank", "is_true", "is_false"}:
+            value = OPERATOR_LABELS.get(atom.operator, atom.operator)
+        elif isinstance(atom.value, (list, tuple, set)):
+            values = [clean_text(value) for value in atom.value]
+            value = "/".join(values[:3]) + ("…" if len(values) > 3 else "")
+        else:
+            value = clean_text(atom.value)
+        filter_parts.append(f"{label} {value}".strip())
+    outcome_parts = [
+        clean_text(outputs.get("action")) or "blank ACTION",
+        (
+            f"stock {clean_text(outputs.get('if_in_stock_action'))}"
+            if clean_text(outputs.get("if_in_stock_action"))
+            else ""
+        ),
+        (
+            f"audit {clean_text(outputs.get('audit_action'))}"
+            if clean_text(outputs.get("audit_action"))
+            else ""
+        ),
+    ]
+    outcome = " / ".join(part for part in outcome_parts if part)
+    filters = " · ".join(filter_parts) or "All rows"
+    return f"{profile_name} — {filters} — {outcome}"
+
+
+class LiteralFilterMiner:
+    """Discover readable pure conjunctions for literal AFTER permutations."""
+
+    def __init__(self, profile: Mapping[str, Any]):
+        self.profile = deepcopy(dict(profile))
+        self.config = self.profile.get("induction") or {}
+        self.rows: tuple[DistilleryProjected, ...] = ()
+        self.atom_coverages: list[tuple[DistilleryAtom, int]] = []
+        self.coverage_by_signature: dict[
+            tuple[str, str, str],
+            int,
+        ] = {}
+        self.filters_by_label: dict[
+            tuple[tuple[str, Any], ...],
+            list[tuple[tuple[DistilleryAtom, ...], int]],
+        ] = defaultdict(list)
+        self.labels: list[tuple[tuple[str, Any], ...]] = []
+        self.all_mask = 0
+
+    @staticmethod
+    def mask_for_indexes(indexes: Iterable[int]) -> int:
+        mask = 0
+        for index in indexes:
+            mask |= 1 << int(index)
+        return mask
+
+    @staticmethod
+    def indexes_for_mask(mask: int) -> Iterator[int]:
+        while mask:
+            least = mask & -mask
+            yield least.bit_length() - 1
+            mask ^= least
+
+    def prepare(self, rows: Sequence[DistilleryProjected]) -> None:
+        self.rows = tuple(rows)
+        self.labels = [row.label for row in self.rows]
+        self.all_mask = (1 << len(self.rows)) - 1 if self.rows else 0
+        literal_profile = deepcopy(self.profile)
+        induction = literal_profile.setdefault("induction", {})
+        governed = [
+            clean_text(field)
+            for field in induction.get("governed_fields") or []
+            if clean_text(field)
+        ]
+        prohibited = {
+            clean_text(field)
+            for field in induction.get("prohibited_predicate_fields") or []
+        }
+        induction["feature_fields"] = [
+            field for field in governed if field not in prohibited
+        ]
+        induction["maximum_category_splits"] = max(
+            int(
+                induction.get(
+                    "literal_maximum_category_splits",
+                    induction.get("maximum_category_splits", 16),
+                )
+            ),
+            128,
+        )
+        induction["maximum_numeric_splits"] = max(
+            int(induction.get("maximum_numeric_splits", 16)),
+            32,
+        )
+        induction["maximum_token_splits"] = max(
+            int(
+                induction.get(
+                    "literal_maximum_token_splits",
+                    induction.get("maximum_token_splits", 24),
+                )
+            ),
+            64,
+        )
+        indexer = SingleFileRuleInducer(literal_profile)
+        indexer.rows = self.rows
+        indexer.prepare_feature_caches()
+        seen: set[tuple[str, str, str]] = set()
+        atoms: list[tuple[DistilleryAtom, int]] = []
+        for atom in indexer.candidate_atoms(tuple(range(len(self.rows)))):
+            if atom.field in prohibited or atom.field not in governed:
+                continue
+            signature = literal_atom_signature(atom)
+            if signature in seen:
+                continue
+            seen.add(signature)
+            coverage = indexer.coverage_for_atom(atom)
+            if not coverage or len(coverage) == len(self.rows):
+                continue
+            atoms.append((atom, self.mask_for_indexes(coverage)))
+        self.atom_coverages = sorted(
+            atoms,
+            key=lambda item: literal_atom_signature(item[0]),
+        )
+        self.coverage_by_signature = {
+            literal_atom_signature(atom): coverage
+            for atom, coverage in self.atom_coverages
+        }
+
+    def path_mask(
+        self,
+        path: Sequence[DistilleryAtom],
+        scope_mask: int | None = None,
+    ) -> int:
+        mask = self.all_mask if scope_mask is None else scope_mask
+        for atom in path:
+            coverage = self.coverage_by_signature.get(
+                literal_atom_signature(atom)
+            )
+            if coverage is None:
+                coverage = self.mask_for_indexes(
+                    index
+                    for index, row in enumerate(self.rows)
+                    if distillery_evaluate_atom(atom, row.features)
+                )
+            mask &= coverage
+            if not mask:
+                break
+        return mask
+
+    def labels_for_mask(
+        self,
+        mask: int,
+    ) -> set[tuple[tuple[str, Any], ...]]:
+        return {self.labels[index] for index in self.indexes_for_mask(mask)}
+
+    def minimize_path(
+        self,
+        path: Sequence[DistilleryAtom],
+        expected: tuple[tuple[str, Any], ...],
+    ) -> tuple[DistilleryAtom, ...]:
+        minimized = list(sorted(path, key=literal_atom_signature))
+        changed = True
+        while changed and len(minimized) > 1:
+            changed = False
+            for index in range(len(minimized)):
+                candidate = minimized[:index] + minimized[index + 1 :]
+                coverage = self.path_mask(candidate)
+                if coverage and self.labels_for_mask(coverage) == {expected}:
+                    minimized = candidate
+                    changed = True
+                    break
+        return tuple(minimized)
+
+    def scope_candidates(
+        self,
+        scope_mask: int,
+        target_mask: int,
+    ) -> list[tuple[tuple[DistilleryAtom, ...], int]]:
+        if not target_mask:
+            return []
+        seed_index = next(self.indexes_for_mask(target_mask))
+        expected = self.labels[seed_index]
+        global_target_mask = self.mask_for_indexes(
+            index
+            for index, label in enumerate(self.labels)
+            if label == expected
+        )
+        global_negative_mask = self.all_mask & ~global_target_mask
+        maximum_atoms = int(
+            self.config.get("maximum_atoms_per_outcome", 64)
+        )
+        maximum_depth = int(self.config.get("maximum_filter_depth", 4))
+        beam_width = int(self.config.get("filter_beam_width", 64))
+        maximum_filters = int(
+            self.config.get("maximum_filters_per_outcome", 16)
+        )
+        selected_filters: list[
+            tuple[tuple[DistilleryAtom, ...], int]
+        ] = [
+            (path, coverage & target_mask)
+            for path, coverage in self.filters_by_label.get(expected, [])
+            if coverage & target_mask
+        ]
+        already_covered = 0
+        for _, coverage in selected_filters:
+            already_covered |= coverage
+        remaining = target_mask & ~already_covered
+        failed_seeds = 0
+        while remaining and len(selected_filters) < maximum_filters:
+            seed_index = next(self.indexes_for_mask(remaining))
+            seed_bit = 1 << seed_index
+            ranked_atoms: list[
+                tuple[tuple[float, int, int, tuple[str, str, str]], DistilleryAtom, int]
+            ] = []
+            for atom, atom_mask in self.atom_coverages:
+                if not (atom_mask & seed_bit):
+                    continue
+                positive = (atom_mask & global_target_mask).bit_count()
+                negative = (atom_mask & global_negative_mask).bit_count()
+                if not positive or negative == global_negative_mask.bit_count():
+                    continue
+                precision = positive / max(positive + negative, 1)
+                ranked_atoms.append(
+                    (
+                        (
+                            precision,
+                            global_negative_mask.bit_count() - negative,
+                            positive,
+                            literal_atom_signature(atom),
+                        ),
+                        atom,
+                        atom_mask,
+                    )
+                )
+            ranked_atoms.sort(key=lambda item: item[0], reverse=True)
+            greedy_mask = self.all_mask
+            greedy_path: list[DistilleryAtom] = []
+            greedy_pool_candidates = [
+                *ranked_atoms[:256],
+                *sorted(
+                    ranked_atoms,
+                    key=lambda item: (
+                        global_negative_mask.bit_count()
+                        - (item[2] & global_negative_mask).bit_count(),
+                        (item[2] & global_target_mask).bit_count(),
+                        item[0],
+                    ),
+                    reverse=True,
+                )[:256],
+            ]
+            greedy_pool = []
+            greedy_seen: set[tuple[str, str, str]] = set()
+            for item in greedy_pool_candidates:
+                signature = literal_atom_signature(item[1])
+                if signature in greedy_seen:
+                    continue
+                greedy_seen.add(signature)
+                greedy_pool.append(item)
+            for _ in range(
+                int(self.config.get("maximum_greedy_filter_depth", 8))
+            ):
+                current_negative = (
+                    greedy_mask & global_negative_mask
+                ).bit_count()
+                if current_negative == 0:
+                    break
+                best_greedy = max(
+                    greedy_pool,
+                    key=lambda item: (
+                        current_negative
+                        - (
+                            greedy_mask
+                            & item[2]
+                            & global_negative_mask
+                        ).bit_count(),
+                        (
+                            greedy_mask
+                            & item[2]
+                            & global_target_mask
+                        ).bit_count(),
+                        item[0],
+                    ),
+                    default=None,
+                )
+                if best_greedy is None:
+                    break
+                narrowed = greedy_mask & best_greedy[2]
+                if (
+                    not (narrowed & seed_bit)
+                    or (
+                        narrowed & global_negative_mask
+                    ).bit_count()
+                    >= current_negative
+                ):
+                    break
+                greedy_path.append(best_greedy[1])
+                greedy_mask = narrowed
+                greedy_pool.remove(best_greedy)
+            greedy_filter = (
+                (
+                    tuple(
+                        sorted(
+                            greedy_path,
+                            key=literal_atom_signature,
+                        )
+                    ),
+                    greedy_mask,
+                )
+                if greedy_path
+                and not (greedy_mask & global_negative_mask)
+                else None
+            )
+
+            # Preserve several ranking views plus the greedy cover so the
+            # minimizing beam is diverse without expanding every atom.
+            candidate_items = [
+                *ranked_atoms[: maximum_atoms // 3],
+                *sorted(
+                    ranked_atoms,
+                    key=lambda item: (
+                        global_negative_mask.bit_count()
+                        - (item[2] & global_negative_mask).bit_count(),
+                        (item[2] & global_target_mask).bit_count(),
+                        item[0],
+                    ),
+                    reverse=True,
+                )[: maximum_atoms // 3],
+                *sorted(
+                    ranked_atoms,
+                    key=lambda item: (
+                        (item[2] & global_target_mask).bit_count(),
+                        item[0],
+                    ),
+                    reverse=True,
+                )[: maximum_atoms // 3],
+            ]
+            if greedy_filter is not None:
+                greedy_signatures = {
+                    literal_atom_signature(atom)
+                    for atom in greedy_filter[0]
+                }
+                candidate_items.extend(
+                    item
+                    for item in ranked_atoms
+                    if literal_atom_signature(item[1])
+                    in greedy_signatures
+                )
+            atoms: list[tuple[DistilleryAtom, int]] = []
+            seen_atom_signatures: set[tuple[str, str, str]] = set()
+            for _, atom, atom_mask in candidate_items:
+                signature = literal_atom_signature(atom)
+                if signature in seen_atom_signatures:
+                    continue
+                seen_atom_signatures.add(signature)
+                atoms.append((atom, atom_mask))
+                if len(atoms) >= maximum_atoms:
+                    break
+            states: list[tuple[int, tuple[int, ...], int]] = [
+                (self.all_mask, (), -1)
+            ]
+            best_filter: tuple[tuple[DistilleryAtom, ...], int] | None = None
+            for _depth in range(1, maximum_depth + 1):
+                next_by_mask: dict[
+                    int,
+                    tuple[int, tuple[int, ...], int],
+                ] = {}
+                pure_at_depth: list[
+                    tuple[tuple[DistilleryAtom, ...], int]
+                ] = []
+                for mask, path_indexes, last_index in states:
+                    for atom_index in range(last_index + 1, len(atoms)):
+                        atom, atom_mask = atoms[atom_index]
+                        narrowed = mask & atom_mask
+                        if not (narrowed & seed_bit) or narrowed == mask:
+                            continue
+                        new_indexes = (*path_indexes, atom_index)
+                        if not (narrowed & global_negative_mask):
+                            path = tuple(
+                                sorted(
+                                    (
+                                        atoms[index][0]
+                                        for index in new_indexes
+                                    ),
+                                    key=literal_atom_signature,
+                                )
+                            )
+                            pure_at_depth.append((path, narrowed))
+                            continue
+                        existing = next_by_mask.get(narrowed)
+                        if existing is None or new_indexes < existing[1]:
+                            next_by_mask[narrowed] = (
+                                narrowed,
+                                new_indexes,
+                                atom_index,
+                            )
+                if pure_at_depth:
+                    # First pure depth is predicate-count minimal. Prefer the
+                    # filter with widest same-outcome coverage at that depth.
+                    best_filter = max(
+                        pure_at_depth,
+                        key=lambda item: (
+                            (item[1] & global_target_mask).bit_count(),
+                            tuple(
+                                literal_atom_signature(atom)
+                                for atom in item[0]
+                            ),
+                        ),
+                    )
+                    break
+                if not next_by_mask:
+                    break
+                states = sorted(
+                    next_by_mask.values(),
+                    key=lambda state: (
+                        (
+                            state[0] & global_target_mask
+                        ).bit_count()
+                        / max(state[0].bit_count(), 1),
+                        (state[0] & global_target_mask).bit_count(),
+                        -(state[0] & global_negative_mask).bit_count(),
+                    ),
+                    reverse=True,
+                )[:beam_width]
+            if best_filter is None:
+                best_filter = greedy_filter
+            if best_filter is None:
+                remaining &= ~seed_bit
+                failed_seeds += 1
+                if failed_seeds >= maximum_filters:
+                    break
+                continue
+            path = self.minimize_path(best_filter[0], expected)
+            coverage = self.path_mask(path)
+            selected_filters.append((path, coverage & target_mask))
+            signature = tuple(
+                literal_atom_signature(atom) for atom in path
+            )
+            if all(
+                tuple(
+                    literal_atom_signature(atom)
+                    for atom in cached_path
+                )
+                != signature
+                for cached_path, _ in self.filters_by_label[expected]
+            ):
+                self.filters_by_label[expected].append((path, coverage))
+            remaining &= ~coverage
+        return selected_filters
+
+    def scope_candidates_within_date(
+        self,
+        scope_mask: int,
+        target_mask: int,
+    ) -> list[tuple[tuple[DistilleryAtom, ...], int]]:
+        """Return a compact pure set-cover basis for one date/outcome."""
+        negative_mask = scope_mask & ~target_mask
+        negative_count = negative_mask.bit_count()
+        ranked: list[
+            tuple[tuple[Any, ...], DistilleryAtom, int]
+        ] = []
+        for atom, atom_mask in self.atom_coverages:
+            local_mask = atom_mask & scope_mask
+            positive = (local_mask & target_mask).bit_count()
+            negative = (local_mask & negative_mask).bit_count()
+            if not positive or local_mask == scope_mask:
+                continue
+            precision = positive / max(positive + negative, 1)
+            ranked.append(
+                (
+                    (
+                        1 if negative == 0 else 0,
+                        precision,
+                        positive,
+                        negative_count - negative,
+                        literal_atom_signature(atom),
+                    ),
+                    atom,
+                    atom_mask,
+                )
+            )
+        ranked.sort(key=lambda item: item[0], reverse=True)
+        maximum_atoms = int(
+            self.config.get("maximum_atoms_per_outcome", 32)
+        )
+        pure = [
+            item for item in ranked if not (item[2] & negative_mask)
+        ]
+        impure = [
+            item for item in ranked if item[2] & negative_mask
+        ]
+        atoms = [
+            (item[1], item[2])
+            for item in [
+                *pure[:maximum_atoms],
+                *impure[:maximum_atoms],
+            ][: maximum_atoms * 2]
+        ]
+        maximum_depth = int(self.config.get("maximum_filter_depth", 4))
+        beam_width = int(self.config.get("filter_beam_width", 32))
+        states: list[tuple[int, tuple[int, ...], int]] = [
+            (scope_mask, (), -1)
+        ]
+        pure_candidates: dict[
+            tuple[tuple[str, str, str], ...],
+            tuple[tuple[DistilleryAtom, ...], int],
+        ] = {}
+        for _depth in range(1, maximum_depth + 1):
+            next_by_mask: dict[
+                int,
+                tuple[int, tuple[int, ...], int],
+            ] = {}
+            for mask, path_indexes, last_index in states:
+                for atom_index in range(last_index + 1, len(atoms)):
+                    atom, atom_mask = atoms[atom_index]
+                    narrowed = mask & atom_mask
+                    if not narrowed or not (narrowed & target_mask):
+                        continue
+                    new_indexes = (*path_indexes, atom_index)
+                    path = tuple(
+                        sorted(
+                            (
+                                atoms[index][0]
+                                for index in new_indexes
+                            ),
+                            key=literal_atom_signature,
+                        )
+                    )
+                    if not (narrowed & negative_mask):
+                        signature = tuple(
+                            literal_atom_signature(item) for item in path
+                        )
+                        existing = pure_candidates.get(signature)
+                        if (
+                            existing is None
+                            or narrowed.bit_count()
+                            > existing[1].bit_count()
+                        ):
+                            pure_candidates[signature] = (
+                                path,
+                                narrowed & target_mask,
+                            )
+                        continue
+                    existing_state = next_by_mask.get(narrowed)
+                    if (
+                        existing_state is None
+                        or len(new_indexes) < len(existing_state[1])
+                    ):
+                        next_by_mask[narrowed] = (
+                            narrowed,
+                            new_indexes,
+                            atom_index,
+                        )
+            if not next_by_mask:
+                break
+            states = sorted(
+                next_by_mask.values(),
+                key=lambda state: (
+                    (
+                        state[0] & target_mask
+                    ).bit_count()
+                    / max(state[0].bit_count(), 1),
+                    (state[0] & target_mask).bit_count(),
+                    -(state[0] & negative_mask).bit_count(),
+                    -len(state[1]),
+                ),
+                reverse=True,
+            )[:beam_width]
+        ranked_candidates = sorted(
+            pure_candidates.values(),
+            key=lambda item: (
+                item[1].bit_count(),
+                -len(item[0]),
+                tuple(
+                    literal_atom_signature(atom) for atom in item[0]
+                ),
+            ),
+            reverse=True,
+        )
+        remaining = target_mask
+        selected: list[tuple[tuple[DistilleryAtom, ...], int]] = []
+        maximum_filters = int(
+            self.config.get("maximum_filters_per_outcome", 16)
+        )
+        while remaining and len(selected) < maximum_filters:
+            best = max(
+                ranked_candidates,
+                key=lambda item: (
+                    (item[1] & remaining).bit_count(),
+                    item[1].bit_count(),
+                    -len(item[0]),
+                ),
+                default=None,
+            )
+            if best is None or not (best[1] & remaining):
+                break
+            selected.append(best)
+            remaining &= ~best[1]
+            ranked_candidates.remove(best)
+        return selected
+
+    def merge_in_rules(
+        self,
+        candidates: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        output = list(candidates)
+        sibling_groups: dict[
+            tuple[Any, ...],
+            list[tuple[dict[str, Any], DistilleryAtom]],
+        ] = defaultdict(list)
+        for candidate in candidates:
+            path = tuple(candidate["path"])
+            for atom_index, atom in enumerate(path):
+                if atom.operator != "eq":
+                    continue
+                skeleton = tuple(
+                    literal_atom_signature(other)
+                    for index, other in enumerate(path)
+                    if index != atom_index
+                )
+                sibling_groups[
+                    (
+                        candidate["label"],
+                        atom.field,
+                        skeleton,
+                    )
+                ].append((candidate, atom))
+        for (label, field, _), siblings in sibling_groups.items():
+            values = sorted(
+                list(
+                    {
+                        clean_text(atom.value)
+                        for _, atom in siblings
+                    }
+                ),
+                key=normalize_key,
+            )
+            if len(values) < 2:
+                continue
+            first_path = tuple(siblings[0][0]["path"])
+            merged_path = tuple(
+                sorted(
+                    [
+                        atom for atom in first_path if atom.field != field
+                    ]
+                    + [DistilleryAtom(field, "in", values)],
+                    key=literal_atom_signature,
+                )
+            )
+            coverage = self.path_mask(merged_path)
+            if not coverage or self.labels_for_mask(coverage) != {label}:
+                continue
+            output.append(
+                {
+                    "path": merged_path,
+                    "label": label,
+                    "coverage": coverage,
+                    "discovered_groups": set().union(
+                        *[
+                            set(candidate["discovered_groups"])
+                            for candidate, _ in siblings
+                        ]
+                    ),
+                }
+            )
+        deduplicated: dict[tuple[Any, ...], dict[str, Any]] = {}
+        for candidate in output:
+            key = (
+                candidate["label"],
+                tuple(
+                    literal_atom_signature(atom)
+                    for atom in candidate["path"]
+                ),
+            )
+            existing = deduplicated.get(key)
+            if existing is None:
+                deduplicated[key] = candidate
+            else:
+                existing["coverage"] |= candidate["coverage"]
+                existing["discovered_groups"].update(
+                    candidate["discovered_groups"]
+                )
+        return list(deduplicated.values())
+
+    def fit(self, rows: Sequence[DistilleryProjected]) -> dict[str, Any]:
+        if not rows:
+            return {
+                "rules": (),
+                "gaps": (),
+                "conflicts": (),
+                "permutations": {},
+            }
+        self.prepare(rows)
+        groups: dict[str, int] = defaultdict(int)
+        label_masks: dict[
+            tuple[str, tuple[tuple[str, Any], ...]],
+            int,
+        ] = defaultdict(int)
+        permutations: dict[str, Counter[str]] = defaultdict(Counter)
+        for index, row in enumerate(self.rows):
+            bit = 1 << index
+            group = row.pair.source_group
+            groups[group] |= bit
+            label_masks[(group, row.label)] |= bit
+            permutations[group][
+                json.dumps(
+                    dict(row.label),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            ] += 1
+        discovered: list[dict[str, Any]] = []
+        for (group, label), target_mask in sorted(
+            label_masks.items(),
+            key=lambda item: (item[0][0], repr(item[0][1])),
+        ):
+            for path, coverage in self.scope_candidates(
+                groups[group],
+                target_mask,
+            ):
+                discovered.append(
+                    {
+                        "path": path,
+                        "label": label,
+                        "coverage": coverage,
+                        "discovered_groups": {group},
+                    }
+                )
+        conflicts: list[dict[str, Any]] = []
+        consolidated: dict[
+            tuple[
+                tuple[tuple[str, str, str], ...],
+                tuple[tuple[str, Any], ...],
+            ],
+            dict[str, Any],
+        ] = {}
+        for candidate in discovered:
+            expected = candidate["label"]
+            path = self.minimize_path(candidate["path"], expected)
+            coverage = self.path_mask(path)
+            labels = self.labels_for_mask(coverage)
+            if labels != {expected}:
+                conflicts.append(
+                    {
+                        "filter": [
+                            {
+                                "field": atom.field,
+                                "op": atom.operator,
+                                "value": _plain_data(atom.value),
+                            }
+                            for atom in path
+                        ],
+                        "expected": dict(expected),
+                        "observed_outcomes": [
+                            dict(label) for label in sorted(labels, key=repr)
+                        ],
+                        "source_groups": sorted(
+                            candidate["discovered_groups"]
+                        ),
+                    }
+                )
+                continue
+            key = (
+                tuple(literal_atom_signature(atom) for atom in path),
+                expected,
+            )
+            existing = consolidated.get(key)
+            if existing is None:
+                consolidated[key] = {
+                    "path": path,
+                    "label": expected,
+                    "coverage": coverage,
+                    "discovered_groups": set(
+                        candidate["discovered_groups"]
+                    ),
+                }
+            else:
+                existing["coverage"] |= coverage
+                existing["discovered_groups"].update(
+                    candidate["discovered_groups"]
+                )
+        candidates = self.merge_in_rules(list(consolidated.values()))
+        candidates.sort(
+            key=lambda item: (
+                -item["coverage"].bit_count(),
+                len(item["path"]),
+                tuple(
+                    literal_atom_signature(atom) for atom in item["path"]
+                ),
+            )
+        )
+        retained: list[dict[str, Any]] = []
+        for candidate in candidates:
+            if any(
+                existing["label"] == candidate["label"]
+                and candidate["coverage"] & ~existing["coverage"] == 0
+                and len(existing["path"]) <= len(candidate["path"])
+                for existing in retained
+            ):
+                continue
+            retained.append(candidate)
+        rules: list[DistilleryRule] = []
+        covered_mask = 0
+        for index, candidate in enumerate(retained):
+            coverage = candidate["coverage"]
+            support_groups = tuple(
+                sorted(
+                    {
+                        self.rows[row_index].pair.source_group
+                        for row_index in self.indexes_for_mask(coverage)
+                    }
+                )
+            )
+            evidence_ids = tuple(
+                self.rows[row_index].pair.pair_id
+                for row_index in self.indexes_for_mask(coverage)
+            )
+            path = tuple(candidate["path"])
+            label = candidate["label"]
+            signature = literal_logic_signature(path, label)
+            rules.append(
+                DistilleryRule(
+                    rule_id=(
+                        "LITERAL-"
+                        f"{clean_text(self.profile.get('profile_id')).upper()}-"
+                        f"{signature[:12].upper()}"
+                    ),
+                    priority=100_000 + index,
+                    predicates=path,
+                    outputs=dict(label),
+                    support=coverage.bit_count(),
+                    confidence=1.0,
+                    source_groups=support_groups,
+                    kind=(
+                        "reusable" if len(support_groups) >= 2 else "one_date"
+                    ),
+                    evidence_ids=evidence_ids,
+                )
+            )
+            covered_mask |= coverage
+        gaps: list[dict[str, Any]] = []
+        for row_index in self.indexes_for_mask(self.all_mask & ~covered_mask):
+            row = self.rows[row_index]
+            gaps.append(
+                {
+                    "gap_id": hashlib.sha256(
+                        f"{row.pair.pair_id}|literal-gap".encode("utf-8")
+                    ).hexdigest()[:24],
+                    "pair_id": row.pair.pair_id,
+                    "source_group": row.pair.source_group,
+                    "before_index": row.pair.before_index,
+                    "after_index": row.pair.after_index,
+                    "expected_outcome": dict(row.label),
+                    "reason": "No globally pure governed-field filter covered this evidence row.",
+                    "evidence": {
+                        "case": clean_text(row.pair.before.get("Case#")),
+                        "business": clean_text(row.pair.before.get("Business")),
+                        "type": clean_text(row.pair.before.get("Type")),
+                        "description": clean_text(
+                            row.pair.before.get("Description")
+                        ),
+                    },
+                }
+            )
+        return {
+            "rules": tuple(sorted(rules, key=lambda item: item.priority)),
+            "gaps": tuple(gaps),
+            "conflicts": tuple(conflicts),
+            "permutations": {
+                group: {
+                    "unique": len(counts),
+                    "counts": dict(counts.most_common()),
+                }
+                for group, counts in sorted(permutations.items())
+            },
+        }
+
+
 def distillery_validate(
     rows: Sequence[DistilleryProjected],
     rules: Sequence[DistilleryRule],
+    feature_fields: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     exact = 0
     matched = 0
@@ -4324,9 +5660,19 @@ def distillery_validate(
         tuple[tuple[str, str], ...],
         set[tuple[tuple[str, Any], ...]],
     ] = defaultdict(set)
+    governed = {
+        clean_text(field) for field in (feature_fields or []) if clean_text(field)
+    }
     for row in rows:
         state = tuple(
-            sorted((key, repr(value)) for key, value in row.features.items())
+            sorted(
+                (key, repr(value))
+                for key, value in row.features.items()
+                if (
+                    (not governed and not key.startswith("__"))
+                    or key in governed
+                )
+            )
         )
         state_outputs[state].add(row.label)
         predicted = SingleFileRuleInducer.predict(row.features, rules)
@@ -4364,6 +5710,46 @@ def distillery_validate(
             }
             for group, stats in sorted(by_group.items())
         },
+    }
+
+
+def literal_distillery_holdouts(
+    rows: Sequence[DistilleryProjected],
+    profile: Mapping[str, Any],
+) -> dict[str, Any]:
+    groups = sorted({row.pair.source_group for row in rows})
+    governed = (
+        (profile.get("induction") or {}).get("governed_fields") or []
+    )
+    folds: dict[str, Any] = {}
+    for holdout in groups:
+        training = [
+            row for row in rows if row.pair.source_group != holdout
+        ]
+        testing = [row for row in rows if row.pair.source_group == holdout]
+        mined = LiteralFilterMiner(profile).fit(training)
+        rules = mined["rules"]
+        validation = distillery_validate(testing, rules, governed)
+        folds[holdout] = {
+            "training_rows": len(training),
+            "testing_rows": len(testing),
+            "rule_count": len(rules),
+            "training_gaps": len(mined["gaps"]),
+            "training_conflicts": len(mined["conflicts"]),
+            "accuracy": validation["accuracy"],
+            "exact": validation["exact_count"],
+            "uncovered": len(validation["uncovered_pair_ids"]),
+            "mismatched": len(validation["mismatched_pair_ids"]),
+        }
+    accuracies = [fold["accuracy"] for fold in folds.values()]
+    return {
+        "strategy": "leave-one-date-out-literal-filters",
+        "folds": folds,
+        "mean_accuracy": (
+            sum(accuracies) / len(accuracies) if accuracies else 0.0
+        ),
+        "minimum_accuracy": min(accuracies) if accuracies else 0.0,
+        "maximum_accuracy": max(accuracies) if accuracies else 0.0,
     }
 
 
@@ -4543,6 +5929,158 @@ def distillery_catalog(
     return catalog
 
 
+def literal_distillery_catalog(
+    rules: Sequence[DistilleryRule],
+    profile: Mapping[str, Any],
+    run_id: str,
+    holdout_accuracy: float,
+    approved_rule_signatures: Sequence[str] | None = None,
+) -> list[dict[str, Any]]:
+    profile_id = clean_text(profile.get("profile_id"))
+    output_contract = {
+        clean_text(item.get("target")): item
+        for item in profile.get("output_fields") or []
+    }
+    approvals = {
+        clean_text(value).lower()
+        for value in (approved_rule_signatures or [])
+        if clean_text(value)
+    }
+    approve_all = "*" in approvals
+    catalog: list[dict[str, Any]] = []
+    for priority, rule in enumerate(
+        sorted(
+            rules,
+            key=lambda item: (
+                0 if item.kind == "reusable" else 1,
+                -len(item.source_groups),
+                -item.support,
+                len(item.predicates),
+                item.rule_id,
+            ),
+        ),
+        start=1,
+    ):
+        signature = literal_logic_signature(rule.predicates, rule.outputs)
+        approved = (
+            rule.kind == "reusable"
+            or approve_all
+            or signature.lower() in approvals
+        )
+        status = "approved" if approved else "ready"
+        actions = [
+            {
+                "type": clean_text(output_contract[target].get("action_type")),
+                "value": clean_text(value),
+                "explicit_final_state": True,
+            }
+            for target, value in rule.outputs.items()
+            if target in output_contract
+        ]
+        predicate = distillery_predicate_json(
+            rule.predicates,
+            profile_id,
+        )
+        name = literal_filter_name(
+            profile_id,
+            rule.predicates,
+            rule.outputs,
+        )
+        source = {
+            "kind": "rules_distillery",
+            "method": "literal_filter_reconstruction",
+            "ruleset_id": profile_id,
+            "ruleset_version": clean_text(profile.get("version")),
+            "distillation_run_id": run_id,
+            "distillery_version": DISTILLERY_VERSION,
+            "distilled_rule_kind": rule.kind,
+            "logic_signature": signature,
+            "support": rule.support,
+            "confidence": 1.0,
+            "support_date_count": len(rule.source_groups),
+            "source_groups": list(rule.source_groups),
+            "evidence_count": len(rule.evidence_ids),
+            "holdout_accuracy": holdout_accuracy,
+            "approval_required": rule.kind == "one_date",
+            "approved": approved,
+            "filter_logic": filter_logic_text(predicate),
+            "outcome": _plain_data(rule.outputs),
+        }
+        rule_uuid = str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"one-engine:literal:{profile_id}:{signature}",
+            )
+        )
+        catalog.append(
+            {
+                "id": rule_uuid,
+                "rule_id": rule.rule_id,
+                "name": name,
+                "rule_group": f"Literal Filters · {profile_id}",
+                "business_scope": "Profile-defined",
+                "request_types": [],
+                "discovery_reference": (
+                    "Per-date BEFORE/AFTER literal filter reconstruction"
+                ),
+                "notes": (
+                    "Minimal globally pure governed-field filter. "
+                    "No evidence fingerprint or row identity predicate."
+                ),
+                "owner_team": "ONE ENGINE",
+                "status": status,
+                "automation_level": (
+                    "alpha" if rule.kind == "reusable" else "reviewed"
+                ),
+                "is_bundled": False,
+                "ruleset_id": profile_id,
+                "distillation_run_id": run_id,
+                "updated_at": iso_now(),
+                "variants": [
+                    {
+                        "id": str(
+                            uuid.uuid5(
+                                uuid.NAMESPACE_URL,
+                                f"one-engine:literal:{profile_id}:{signature}:variant",
+                            )
+                        ),
+                        "rule_id": rule.rule_id,
+                        "runtime_rule_id": f"{rule.rule_id}.01",
+                        "runtime_kind": "row_rule",
+                        "execution_priority": 100_000 + priority,
+                        "enabled": approved,
+                        "is_executable": True,
+                        "stop_processing": True,
+                        "predicate_json": predicate,
+                        "action_json": actions,
+                        "description": name,
+                        "automation_level": (
+                            "alpha" if rule.kind == "reusable" else "reviewed"
+                        ),
+                        "status": status,
+                        "source": source,
+                    }
+                ],
+                "source": source,
+            }
+        )
+    return catalog
+
+
+def candidate_catalog_for_test(
+    catalog: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Enable an immutable candidate in memory without changing active rules."""
+    output = deepcopy([dict(rule) for rule in catalog])
+    for rule in output:
+        rule["status"] = "approved"
+        for variant in rule.get("variants") or []:
+            if isinstance(variant, MutableMapping):
+                variant["enabled"] = True
+                variant["status"] = "approved"
+    return output
+
+
 def run_rules_distillery(
     *,
     profile_id: str,
@@ -4551,6 +6089,9 @@ def run_rules_distillery(
     after_file_name: str,
     after_bytes: bytes,
     run_holdouts: bool = True,
+    outcome_aliases: Mapping[str, Mapping[str, Any]] | None = None,
+    approved_alias_keys: Sequence[str] | None = None,
+    approved_rule_signatures: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     profile = distillery_profile(profile_id)
     before_documents = distillery_documents_from_upload(
@@ -4563,19 +6104,27 @@ def run_rules_distillery(
         after_bytes,
         profile,
     )
+    alias_registry = distillery_outcome_alias_registry(
+        after_documents,
+        profile,
+        outcome_aliases,
+        approved_alias_keys,
+    )
     pairs, unmatched = distillery_match_documents(
         before_documents,
         after_documents,
         profile,
+        outcome_aliases,
     )
     projected = distillery_project_pairs(pairs, profile)
-    rules = SingleFileRuleInducer(profile).fit(
-        projected,
-        include_exceptions=True,
+    mined = LiteralFilterMiner(profile).fit(projected)
+    rules = mined["rules"]
+    governed = (
+        (profile.get("induction") or {}).get("governed_fields") or []
     )
-    validation = distillery_validate(projected, rules)
+    validation = distillery_validate(projected, rules, governed)
     holdout = (
-        distillery_holdouts(projected, profile)
+        literal_distillery_holdouts(projected, profile)
         if run_holdouts
         else {
             "strategy": "not-run",
@@ -4585,13 +6134,55 @@ def run_rules_distillery(
             "maximum_accuracy": 0.0,
         }
     )
+    approvals = {
+        clean_text(value).lower()
+        for value in (approved_rule_signatures or [])
+        if clean_text(value)
+    }
+    approve_all_rules = "*" in approvals
+    pending_one_date = [
+        {
+            "logic_signature": literal_logic_signature(
+                rule.predicates,
+                rule.outputs,
+            ),
+            "rule_id": rule.rule_id,
+            "name": literal_filter_name(
+                profile_id,
+                rule.predicates,
+                rule.outputs,
+            ),
+            "support_rows": rule.support,
+            "source_groups": list(rule.source_groups),
+        }
+        for rule in rules
+        if rule.kind == "one_date"
+        and not approve_all_rules
+        and literal_logic_signature(
+            rule.predicates,
+            rule.outputs,
+        ).lower()
+        not in approvals
+    ]
+    gaps = list(mined["gaps"])
+    conflicts = list(mined["conflicts"])
     deployment_eligible = (
         validation["accuracy"] == 1.0
         and validation["contradictions"] == 0
         and not unmatched
+        and not gaps
+        and not conflicts
+        and not pending_one_date
+        and int(alias_registry.get("review_required") or 0) == 0
     )
     before_hash = hashlib.sha256(before_bytes).hexdigest()
     after_hash = hashlib.sha256(after_bytes).hexdigest()
+    alias_hash = hashlib.sha256(
+        json_dumps(_plain_data(outcome_aliases or {})).encode("utf-8")
+    ).hexdigest()
+    approval_hash = hashlib.sha256(
+        "|".join(sorted(approvals)).encode("utf-8")
+    ).hexdigest()
     run_id = hashlib.sha256(
         "|".join(
             [
@@ -4600,6 +6191,8 @@ def run_rules_distillery(
                 clean_text(profile.get("version")),
                 before_hash,
                 after_hash,
+                alias_hash,
+                approval_hash,
                 "holdouts" if run_holdouts else "draft",
             ]
         ).encode("utf-8")
@@ -4612,6 +6205,50 @@ def run_rules_distillery(
         json.dumps(dict(row.label), sort_keys=True, ensure_ascii=False)
         for row in projected
     )
+    raw_permutations_by_date: dict[str, Any] = {}
+    canonical_permutations_by_date: dict[str, Any] = {}
+    contracts = profile.get("output_fields") or []
+    for document in after_documents:
+        raw_counts: Counter[str] = Counter()
+        canonical_counts: Counter[str] = Counter()
+        for row in document.get("rows") or []:
+            raw_outcome = {
+                clean_text(contract.get("target")): clean_text(
+                    row.get(clean_text(contract.get("source")))
+                )
+                for contract in contracts
+            }
+            canonical_outcome = {
+                target: distillery_outcome_value(
+                    target,
+                    value,
+                    outcome_aliases,
+                )
+                for target, value in raw_outcome.items()
+            }
+            raw_counts[
+                json.dumps(
+                    raw_outcome,
+                    sort_keys=True,
+                    ensure_ascii=False,
+                )
+            ] += 1
+            canonical_counts[
+                json.dumps(
+                    canonical_outcome,
+                    sort_keys=True,
+                    ensure_ascii=False,
+                )
+            ] += 1
+        source_group = clean_text(document.get("source_group"))
+        raw_permutations_by_date[source_group] = {
+            "unique": len(raw_counts),
+            "counts": dict(raw_counts.most_common()),
+        }
+        canonical_permutations_by_date[source_group] = {
+            "unique": len(canonical_counts),
+            "counts": dict(canonical_counts.most_common()),
+        }
     report = {
         "run_id": run_id,
         "profile_id": profile_id,
@@ -4648,17 +6285,39 @@ def run_rules_distillery(
         "labels": {
             "unique": len(labels),
             "counts": dict(labels.most_common()),
+            "fields": [
+                "ACTION",
+                "If In Stock: Action",
+                "Audit Action",
+            ],
+            "alias_registry": alias_registry,
+            "raw_permutations_by_date": raw_permutations_by_date,
+            "canonical_permutations_by_date": (
+                canonical_permutations_by_date
+            ),
+            "permutations_by_date": mined["permutations"],
         },
         "rules": {
             "total": len(rules),
-            "general": sum(rule.kind == "general" for rule in rules),
-            "exception": sum(rule.kind == "exception" for rule in rules),
-            "general_support": sum(
-                rule.support for rule in rules if rule.kind == "general"
+            "reusable": sum(rule.kind == "reusable" for rule in rules),
+            "one_date": sum(rule.kind == "one_date" for rule in rules),
+            "pending_approval": len(pending_one_date),
+            "reusable_support": sum(
+                rule.support for rule in rules if rule.kind == "reusable"
             ),
-            "exception_support": sum(
-                rule.support for rule in rules if rule.kind == "exception"
+            "one_date_support": sum(
+                rule.support for rule in rules if rule.kind == "one_date"
             ),
+            "forbidden_runtime_predicates": 0,
+        },
+        "pending_rule_approvals": pending_one_date,
+        "gaps": {
+            "count": len(gaps),
+            "records": gaps,
+        },
+        "conflicts": {
+            "count": len(conflicts),
+            "records": conflicts,
         },
         "validation": validation,
         "holdout": holdout,
@@ -4668,26 +6327,41 @@ def run_rules_distillery(
                 "corpus_accuracy": 1.0,
                 "unmatched_rows": 0,
                 "contradictions": 0,
+                "gaps": 0,
+                "filter_conflicts": 0,
+                "pending_rule_approvals": 0,
+                "pending_alias_reviews": 0,
+                "forbidden_runtime_predicates": 0,
             },
             "observed": {
                 "corpus_accuracy": validation["accuracy"],
                 "unmatched_rows": len(unmatched),
                 "contradictions": validation["contradictions"],
+                "gaps": len(gaps),
+                "filter_conflicts": len(conflicts),
+                "pending_rule_approvals": len(pending_one_date),
+                "pending_alias_reviews": int(
+                    alias_registry.get("review_required") or 0
+                ),
+                "forbidden_runtime_predicates": 0,
             },
         },
     }
-    catalog = distillery_catalog(
+    catalog = literal_distillery_catalog(
         rules,
         profile,
         run_id,
         float(holdout.get("mean_accuracy") or 0.0),
-        deployment_eligible,
+        approved_rule_signatures,
     )
     return {
         "run_id": run_id,
         "profile_id": profile_id,
         "catalog": catalog,
         "report": report,
+        "gaps": gaps,
+        "conflicts": conflicts,
+        "alias_registry": alias_registry,
         "deployment_eligible": deployment_eligible,
     }
 
@@ -5240,6 +6914,7 @@ def export_value(row: Mapping[str, Any], header: str, lookup: Mapping[str, int])
         "Description": clean_text(row.get("description")),
         "ACTION": clean_text(row.get("action")),
         "If In Stock: Action": clean_text(row.get("if_in_stock_action")),
+        "Audit Action": clean_text(row.get("audit_action")),
         "Buysmart Action": clean_text(row.get("buysmart_action")),
         "Assigned Bucket": bucket_for_row(row)["label"],
         "Rule Applied": clean_text(row.get("rule_applied")),
@@ -5287,6 +6962,7 @@ def applied_rule_value(
         "Matched At": clean_text(trace.get("matchedAt")),
         "Final ACTION": clean_text(row.get("action")),
         "Final If In Stock: Action": clean_text(row.get("if_in_stock_action")),
+        "Final Audit Action": clean_text(row.get("audit_action")),
         "Final Buysmart Action": clean_text(row.get("buysmart_action")),
         "Compliance Bucket": bucket_for_row(row)["label"],
         "Outcome Reporting": clean_text(row.get("outcome_reporting")),
@@ -5844,7 +7520,14 @@ class SnowflakeRulesStore:
         catalog: Sequence[Mapping[str, Any]],
         report: Mapping[str, Any],
     ) -> dict[str, Any]:
-        """Atomically promote one Distillery run into the Snowflake catalog."""
+        """Deprecated direct promotion path retained only for API compatibility."""
+        raise RuntimeError(
+            "Direct Distillery promotion is disabled. Save an immutable "
+            "catalog candidate and activate its catalog_version_id instead."
+        )
+        # Unreachable compatibility implementation below is intentionally
+        # retained for old serialized sessions and will be removed after the
+        # versioned-catalog migration window.
         if not catalog:
             raise ValueError("The distilled catalog is empty.")
         deployment_gate = report.get("deployment_gate") or {}
@@ -5902,6 +7585,680 @@ class SnowflakeRulesStore:
             "profile_id": profile_id,
             "promoted_rule_count": len(catalog),
             "retired_rule_count": len(retired),
+        }
+
+    def load_outcome_aliases(
+        self,
+        workflow_id: str,
+    ) -> dict[str, dict[str, str]]:
+        query = f"""
+            SELECT
+                FIELD_NAME,
+                RAW_VALUE_KEY,
+                CANONICAL_VALUE
+            FROM {self.table('outcome_aliases')}
+            WHERE WORKFLOW_ID = ?
+              AND STATUS = 'APPROVED'
+            ORDER BY FIELD_NAME, RAW_VALUE_KEY
+        """
+        output: dict[str, dict[str, str]] = defaultdict(dict)
+        for row in self.collect(query, [clean_text(workflow_id)]):
+            data = snowflake_row_dict(row)
+            output[clean_text(data.get("field_name"))][
+                clean_text(data.get("raw_value_key"))
+            ] = clean_text(data.get("canonical_value"))
+        return dict(output)
+
+    def save_outcome_aliases(
+        self,
+        workflow_id: str,
+        entries: Sequence[Mapping[str, Any]],
+    ) -> int:
+        values = [
+            {
+                "workflow_id": clean_text(workflow_id),
+                "field_name": clean_text(entry.get("field_name")),
+                "raw_value_key": normalize_key(entry.get("raw_value")),
+                "raw_value": clean_text(entry.get("raw_value")),
+                "canonical_value": clean_text(entry.get("canonical_value")),
+                "status": "APPROVED",
+                "updated_by": self.current_user(),
+                "updated_at": iso_now(),
+            }
+            for entry in entries
+            if clean_text(entry.get("field_name"))
+        ]
+        if not values:
+            return 0
+        query = f"""
+            MERGE INTO {self.table('outcome_aliases')} AS target
+            USING (
+                SELECT
+                    value:"workflow_id"::VARCHAR AS WORKFLOW_ID,
+                    value:"field_name"::VARCHAR AS FIELD_NAME,
+                    value:"raw_value_key"::VARCHAR AS RAW_VALUE_KEY,
+                    value:"raw_value"::VARCHAR AS RAW_VALUE,
+                    value:"canonical_value"::VARCHAR AS CANONICAL_VALUE,
+                    value:"status"::VARCHAR AS STATUS,
+                    value:"updated_by"::VARCHAR AS UPDATED_BY,
+                    TRY_TO_TIMESTAMP_TZ(value:"updated_at"::VARCHAR) AS UPDATED_AT
+                FROM TABLE(FLATTEN(INPUT => PARSE_JSON(?)))
+            ) AS source
+            ON target.WORKFLOW_ID = source.WORKFLOW_ID
+               AND target.FIELD_NAME = source.FIELD_NAME
+               AND target.RAW_VALUE_KEY = source.RAW_VALUE_KEY
+            WHEN MATCHED THEN UPDATE SET
+                RAW_VALUE = source.RAW_VALUE,
+                CANONICAL_VALUE = source.CANONICAL_VALUE,
+                STATUS = source.STATUS,
+                UPDATED_BY = source.UPDATED_BY,
+                UPDATED_AT = source.UPDATED_AT
+            WHEN NOT MATCHED THEN INSERT (
+                WORKFLOW_ID, FIELD_NAME, RAW_VALUE_KEY, RAW_VALUE,
+                CANONICAL_VALUE, STATUS, UPDATED_BY, UPDATED_AT
+            ) VALUES (
+                source.WORKFLOW_ID, source.FIELD_NAME, source.RAW_VALUE_KEY,
+                source.RAW_VALUE, source.CANONICAL_VALUE, source.STATUS,
+                source.UPDATED_BY, source.UPDATED_AT
+            )
+        """
+        with self.transaction():
+            self.execute(query, [json_dumps(values)])
+            self.log_event(
+                entity_type="outcome_aliases",
+                entity_id=clean_text(workflow_id),
+                action="save_outcome_aliases",
+                details={"workflow_id": workflow_id, "entry_count": len(values)},
+            )
+        return len(values)
+
+    def _catalog_version_from_row(self, row: Any) -> dict[str, Any]:
+        data = snowflake_row_dict(row)
+        payload = normalize_persisted_json(data.get("version_json"), {})
+        output = dict(payload) if isinstance(payload, Mapping) else {}
+        output.update(
+            {
+                "id": clean_text(data.get("id") or output.get("id")),
+                "workflow_id": clean_text(
+                    data.get("workflow_id") or output.get("workflow_id")
+                ),
+                "version_number": int(
+                    data.get("version_number")
+                    or output.get("version_number")
+                    or 0
+                ),
+                "status": clean_text(data.get("status") or output.get("status")),
+                "distillery_run_id": clean_text(
+                    data.get("distillery_run_id")
+                    or output.get("distillery_run_id")
+                ),
+                "parent_version_id": clean_text(
+                    data.get("parent_version_id")
+                    or output.get("parent_version_id")
+                ),
+                "created_by": clean_text(
+                    data.get("created_by") or output.get("created_by")
+                ),
+                "created_at": timestamp_text(
+                    data.get("created_at") or output.get("created_at")
+                ),
+                "activated_by": clean_text(
+                    data.get("activated_by") or output.get("activated_by")
+                ),
+                "activated_at": timestamp_text(
+                    data.get("activated_at") or output.get("activated_at")
+                ),
+            }
+        )
+        return output
+
+    def list_catalog_versions(
+        self,
+        workflow_id: str,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        safe_limit = max(1, min(int(limit), 1000))
+        query = f"""
+            SELECT
+                ID, WORKFLOW_ID, VERSION_NUMBER, STATUS,
+                DISTILLERY_RUN_ID, PARENT_VERSION_ID,
+                CREATED_BY, CREATED_AT, ACTIVATED_BY, ACTIVATED_AT,
+                TO_JSON(VERSION_JSON) AS VERSION_JSON
+            FROM {self.table('catalog_versions')}
+            WHERE WORKFLOW_ID = ?
+            ORDER BY VERSION_NUMBER DESC
+            LIMIT {safe_limit}
+        """
+        return [
+            self._catalog_version_from_row(row)
+            for row in self.collect(query, [clean_text(workflow_id)])
+        ]
+
+    def get_catalog_version(
+        self,
+        version_id: str,
+    ) -> dict[str, Any] | None:
+        query = f"""
+            SELECT
+                ID, WORKFLOW_ID, VERSION_NUMBER, STATUS,
+                DISTILLERY_RUN_ID, PARENT_VERSION_ID,
+                CREATED_BY, CREATED_AT, ACTIVATED_BY, ACTIVATED_AT,
+                TO_JSON(VERSION_JSON) AS VERSION_JSON
+            FROM {self.table('catalog_versions')}
+            WHERE ID = ?
+            LIMIT 1
+        """
+        rows = self.collect(query, [clean_text(version_id)])
+        return self._catalog_version_from_row(rows[0]) if rows else None
+
+    def upsert_catalog_version_rules(
+        self,
+        version_id: str,
+        workflow_id: str,
+        rules: Sequence[Mapping[str, Any]],
+    ) -> None:
+        if not rules:
+            return
+        values = [
+            {
+                "id": f"{version_id}:{clean_text(rule.get('rule_id'))}",
+                "catalog_version_id": version_id,
+                "workflow_id": workflow_id,
+                "rule_id": clean_text(rule.get("rule_id")),
+                "rule_json": _plain_data(rule),
+                "created_at": iso_now(),
+            }
+            for rule in rules
+        ]
+        for batch in chunked(values):
+            query = f"""
+                INSERT INTO {self.table('catalog_rules')} (
+                    ID, CATALOG_VERSION_ID, WORKFLOW_ID, RULE_ID,
+                    RULE_JSON, CREATED_AT
+                )
+                SELECT
+                    value:"id"::VARCHAR,
+                    value:"catalog_version_id"::VARCHAR,
+                    value:"workflow_id"::VARCHAR,
+                    value:"rule_id"::VARCHAR,
+                    value:"rule_json",
+                    TRY_TO_TIMESTAMP_TZ(value:"created_at"::VARCHAR)
+                FROM TABLE(FLATTEN(INPUT => PARSE_JSON(?)))
+            """
+            self.execute(query, [json_dumps(batch)])
+
+    def load_catalog_version_rules(
+        self,
+        version_id: str,
+    ) -> list[dict[str, Any]]:
+        query = f"""
+            SELECT TO_JSON(RULE_JSON) AS RULE_JSON
+            FROM {self.table('catalog_rules')}
+            WHERE CATALOG_VERSION_ID = ?
+            ORDER BY RULE_ID
+        """
+        output: list[dict[str, Any]] = []
+        for row in self.collect(query, [clean_text(version_id)]):
+            rule = normalize_persisted_json(
+                snowflake_row_dict(row).get("rule_json"),
+                {},
+            )
+            if isinstance(rule, dict) and rule:
+                output.append(rule)
+        return output
+
+    def save_catalog_candidate(
+        self,
+        catalog: Sequence[Mapping[str, Any]],
+        report: Mapping[str, Any],
+        gaps: Sequence[Mapping[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        workflow_id = clean_text(report.get("profile_id"))
+        run_id = clean_text(report.get("run_id"))
+        if not workflow_id or not run_id:
+            raise ValueError("Candidate workflow and Distillery run ID are required.")
+        # Preserve the pre-versioning workflow catalog as the first rollback
+        # point before attaching a candidate to its active parent.
+        self.bootstrap_legacy_catalog(workflow_id)
+        existing = self.scalar(
+            f"""
+                SELECT ID AS VALUE
+                FROM {self.table('catalog_versions')}
+                WHERE WORKFLOW_ID = ? AND DISTILLERY_RUN_ID = ?
+                LIMIT 1
+            """,
+            [workflow_id, run_id],
+            "",
+        )
+        if clean_text(existing):
+            version = self.get_catalog_version(clean_text(existing))
+            if version is None:
+                raise RuntimeError("The existing candidate version could not be loaded.")
+            return version
+        version_number = int(
+            self.scalar(
+                f"""
+                    SELECT COALESCE(MAX(VERSION_NUMBER), 0) + 1 AS VALUE
+                    FROM {self.table('catalog_versions')}
+                    WHERE WORKFLOW_ID = ?
+                """,
+                [workflow_id],
+                1,
+            )
+            or 1
+        )
+        active = next(
+            (
+                item
+                for item in self.list_catalog_versions(workflow_id)
+                if clean_text(item.get("status")).upper() == "ACTIVE"
+            ),
+            None,
+        )
+        version_id = str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"one-engine:catalog-version:{workflow_id}:{run_id}",
+            )
+        )
+        timestamp = iso_now()
+        version = {
+            "id": version_id,
+            "workflow_id": workflow_id,
+            "version_number": version_number,
+            "status": "CANDIDATE",
+            "distillery_run_id": run_id,
+            "parent_version_id": clean_text(
+                (active or {}).get("id")
+            ),
+            "rule_count": len(catalog),
+            "gap_count": len(gaps or []),
+            "deployment_eligible": bool_value(
+                (report.get("deployment_gate") or {}).get("eligible")
+            ),
+            "report": _plain_data(report),
+            "created_by": self.current_user(),
+            "created_at": timestamp,
+            "activated_by": "",
+            "activated_at": "",
+        }
+        insert = f"""
+            INSERT INTO {self.table('catalog_versions')} (
+                ID, WORKFLOW_ID, VERSION_NUMBER, STATUS,
+                DISTILLERY_RUN_ID, PARENT_VERSION_ID,
+                CREATED_BY, CREATED_AT, ACTIVATED_BY, ACTIVATED_AT,
+                VERSION_JSON
+            )
+            SELECT
+                ?, ?, ?, 'CANDIDATE', ?, NULLIF(?, ''),
+                ?, TRY_TO_TIMESTAMP_TZ(?), NULL, NULL, PARSE_JSON(?)
+        """
+        gap_values = [
+            {
+                "id": clean_text(gap.get("gap_id")) or new_id(),
+                "catalog_version_id": version_id,
+                "workflow_id": workflow_id,
+                "source_group": clean_text(gap.get("source_group")),
+                "pair_id": clean_text(gap.get("pair_id")),
+                "status": "OPEN",
+                "resolution": "",
+                "gap_json": _plain_data(gap),
+                "created_at": timestamp,
+                "updated_at": timestamp,
+            }
+            for gap in (gaps or [])
+        ]
+        with self.transaction():
+            self.execute(
+                insert,
+                [
+                    version_id,
+                    workflow_id,
+                    version_number,
+                    run_id,
+                    version["parent_version_id"],
+                    version["created_by"],
+                    timestamp,
+                    json_dumps(version),
+                ],
+            )
+            self.upsert_catalog_version_rules(
+                version_id,
+                workflow_id,
+                catalog,
+            )
+            if gap_values:
+                self.execute(
+                    f"""
+                        INSERT INTO {self.table('distillery_gaps')} (
+                            ID, CATALOG_VERSION_ID, WORKFLOW_ID, SOURCE_GROUP,
+                            PAIR_ID, STATUS, RESOLUTION, GAP_JSON,
+                            CREATED_AT, UPDATED_AT
+                        )
+                        SELECT
+                            value:"id"::VARCHAR,
+                            value:"catalog_version_id"::VARCHAR,
+                            value:"workflow_id"::VARCHAR,
+                            value:"source_group"::VARCHAR,
+                            value:"pair_id"::VARCHAR,
+                            value:"status"::VARCHAR,
+                            value:"resolution"::VARCHAR,
+                            value:"gap_json",
+                            TRY_TO_TIMESTAMP_TZ(value:"created_at"::VARCHAR),
+                            TRY_TO_TIMESTAMP_TZ(value:"updated_at"::VARCHAR)
+                        FROM TABLE(FLATTEN(INPUT => PARSE_JSON(?)))
+                    """,
+                    [json_dumps(gap_values)],
+                )
+            self.log_event(
+                entity_type="catalog_version",
+                entity_id=version_id,
+                action="save_catalog_candidate",
+                after=version,
+                details={
+                    "workflow_id": workflow_id,
+                    "rule_count": len(catalog),
+                    "gap_count": len(gap_values),
+                },
+            )
+        return version
+
+    def bootstrap_legacy_catalog(
+        self,
+        workflow_id: str,
+    ) -> dict[str, Any] | None:
+        versions = self.list_catalog_versions(workflow_id)
+        active = next(
+            (
+                item
+                for item in versions
+                if clean_text(item.get("status")).upper() == "ACTIVE"
+            ),
+            None,
+        )
+        if active is not None:
+            return active
+        rules = [
+            rule
+            for rule in self.load_rules()
+            if rule_workflow_id(rule) == workflow_id
+        ]
+        if not rules:
+            return None
+        version_number = max(
+            [int(item.get("version_number") or 0) for item in versions] or [0]
+        ) + 1
+        version_id = str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"one-engine:legacy-catalog:{workflow_id}:{catalog_snapshot(rules).get('sha256')}",
+            )
+        )
+        timestamp = iso_now()
+        version = {
+            "id": version_id,
+            "workflow_id": workflow_id,
+            "version_number": version_number,
+            "status": "ACTIVE",
+            "distillery_run_id": "legacy-bootstrap",
+            "parent_version_id": "",
+            "rule_count": len(rules),
+            "gap_count": 0,
+            "deployment_eligible": True,
+            "report": {
+                "method": "legacy_catalog_bootstrap",
+                "snapshot": catalog_snapshot(rules),
+            },
+            "created_by": self.current_user(),
+            "created_at": timestamp,
+            "activated_by": self.current_user(),
+            "activated_at": timestamp,
+        }
+        with self.transaction():
+            self.execute(
+                f"""
+                    INSERT INTO {self.table('catalog_versions')} (
+                        ID, WORKFLOW_ID, VERSION_NUMBER, STATUS,
+                        DISTILLERY_RUN_ID, PARENT_VERSION_ID,
+                        CREATED_BY, CREATED_AT, ACTIVATED_BY, ACTIVATED_AT,
+                        VERSION_JSON
+                    )
+                    SELECT
+                        ?, ?, ?, 'ACTIVE', 'legacy-bootstrap', NULL,
+                        ?, TRY_TO_TIMESTAMP_TZ(?), ?,
+                        TRY_TO_TIMESTAMP_TZ(?), PARSE_JSON(?)
+                """,
+                [
+                    version_id,
+                    workflow_id,
+                    version_number,
+                    version["created_by"],
+                    timestamp,
+                    version["activated_by"],
+                    timestamp,
+                    json_dumps(version),
+                ],
+            )
+            self.upsert_catalog_version_rules(
+                version_id,
+                workflow_id,
+                rules,
+            )
+            self.log_event(
+                entity_type="catalog_version",
+                entity_id=version_id,
+                action="bootstrap_legacy_catalog",
+                after=version,
+                details={"workflow_id": workflow_id, "rule_count": len(rules)},
+            )
+        return version
+
+    def activate_catalog_version(
+        self,
+        version_id: str,
+    ) -> dict[str, Any]:
+        target = self.get_catalog_version(version_id)
+        if target is None:
+            raise ValueError("The selected catalog version does not exist.")
+        workflow_id = clean_text(target.get("workflow_id"))
+        status = clean_text(target.get("status")).upper()
+        if status == "CANDIDATE" and not bool_value(
+            target.get("deployment_eligible")
+        ):
+            raise ValueError(
+                "The candidate has not passed the literal-filter deployment gate."
+            )
+        if status not in {"CANDIDATE", "RETIRED", "ACTIVE"}:
+            raise ValueError(f"Catalog version status {status!r} cannot be activated.")
+        open_gaps = int(
+            self.scalar(
+                f"""
+                    SELECT COUNT(*) AS VALUE
+                    FROM {self.table('distillery_gaps')}
+                    WHERE CATALOG_VERSION_ID = ?
+                      AND STATUS <> 'RESOLVED'
+                """,
+                [version_id],
+                0,
+            )
+            or 0
+        )
+        if open_gaps:
+            raise ValueError(
+                f"The selected catalog version has {open_gaps:,} unresolved "
+                "Distillery gap(s). Rebuild a complete candidate before activation."
+            )
+        self.bootstrap_legacy_catalog(workflow_id)
+        rules = self.load_catalog_version_rules(version_id)
+        if not rules:
+            raise ValueError("The selected catalog version contains no rules.")
+        timestamp = iso_now()
+        user = self.current_user()
+        with self.transaction():
+            self.execute(
+                f"""
+                    DELETE FROM {self.table('rules')}
+                    WHERE COALESCE(
+                        NULLIF(RULE_JSON:"ruleset_id"::VARCHAR, ''),
+                        NULLIF(RULE_JSON:"source":"ruleset_id"::VARCHAR, ''),
+                        'product_request'
+                    ) = ?
+                """,
+                [workflow_id],
+            )
+            self.upsert_rules(rules)
+            self.execute(
+                f"""
+                    UPDATE {self.table('catalog_versions')}
+                    SET STATUS = 'RETIRED'
+                    WHERE WORKFLOW_ID = ?
+                      AND STATUS = 'ACTIVE'
+                      AND ID <> ?
+                """,
+                [workflow_id, version_id],
+            )
+            self.execute(
+                f"""
+                    UPDATE {self.table('catalog_versions')}
+                    SET
+                        STATUS = 'ACTIVE',
+                        ACTIVATED_BY = ?,
+                        ACTIVATED_AT = TRY_TO_TIMESTAMP_TZ(?),
+                        VERSION_JSON = OBJECT_INSERT(
+                            OBJECT_INSERT(VERSION_JSON, 'status', 'ACTIVE', TRUE),
+                            'activated_at', ?, TRUE
+                        )
+                    WHERE ID = ?
+                """,
+                [user, timestamp, timestamp, version_id],
+            )
+            self.log_event(
+                entity_type="catalog_version",
+                entity_id=version_id,
+                action=(
+                    "rollback_catalog_version"
+                    if status == "RETIRED"
+                    else "activate_catalog_version"
+                ),
+                after={
+                    **target,
+                    "status": "ACTIVE",
+                    "activated_by": user,
+                    "activated_at": timestamp,
+                },
+                details={
+                    "workflow_id": workflow_id,
+                    "rule_count": len(rules),
+                    "previous_status": status,
+                },
+            )
+        activated = self.get_catalog_version(version_id)
+        if activated is None:
+            raise RuntimeError("Activated catalog version could not be reloaded.")
+        return activated
+
+    def list_distillery_gaps(
+        self,
+        version_id: str,
+        limit: int = 1000,
+    ) -> list[dict[str, Any]]:
+        safe_limit = max(1, min(int(limit), 10000))
+        query = f"""
+            SELECT
+                ID, CATALOG_VERSION_ID, WORKFLOW_ID, SOURCE_GROUP,
+                PAIR_ID, STATUS, RESOLUTION,
+                TO_JSON(GAP_JSON) AS GAP_JSON,
+                CREATED_AT, UPDATED_AT
+            FROM {self.table('distillery_gaps')}
+            WHERE CATALOG_VERSION_ID = ?
+            ORDER BY SOURCE_GROUP, PAIR_ID
+            LIMIT {safe_limit}
+        """
+        output: list[dict[str, Any]] = []
+        for row in self.collect(query, [clean_text(version_id)]):
+            data = snowflake_row_dict(row)
+            gap = normalize_persisted_json(data.get("gap_json"), {})
+            item = dict(gap) if isinstance(gap, Mapping) else {}
+            item.update(
+                {
+                    "id": clean_text(data.get("id")),
+                    "catalog_version_id": clean_text(
+                        data.get("catalog_version_id")
+                    ),
+                    "workflow_id": clean_text(data.get("workflow_id")),
+                    "source_group": clean_text(data.get("source_group")),
+                    "pair_id": clean_text(data.get("pair_id")),
+                    "status": clean_text(data.get("status")),
+                    "resolution": clean_text(data.get("resolution")),
+                    "created_at": timestamp_text(data.get("created_at")),
+                    "updated_at": timestamp_text(data.get("updated_at")),
+                }
+            )
+            output.append(item)
+        return output
+
+    def resolve_distillery_gap(
+        self,
+        gap_id: str,
+        resolution: str,
+    ) -> dict[str, Any]:
+        gap_key = clean_text(gap_id)
+        resolution_text = clean_text(resolution)
+        if not gap_key:
+            raise ValueError("A Distillery gap ID is required.")
+        if not resolution_text:
+            raise ValueError("A gap resolution note is required.")
+        rows = self.collect(
+            f"""
+                SELECT
+                    ID, CATALOG_VERSION_ID, WORKFLOW_ID, SOURCE_GROUP,
+                    PAIR_ID, STATUS, RESOLUTION,
+                    TO_JSON(GAP_JSON) AS GAP_JSON,
+                    CREATED_AT, UPDATED_AT
+                FROM {self.table('distillery_gaps')}
+                WHERE ID = ?
+                LIMIT 1
+            """,
+            [gap_key],
+        )
+        if not rows:
+            raise ValueError("The selected Distillery gap no longer exists.")
+        before_data = snowflake_row_dict(rows[0])
+        with self.transaction():
+            self.execute(
+                f"""
+                    UPDATE {self.table('distillery_gaps')}
+                    SET
+                        STATUS = 'RESOLVED',
+                        RESOLUTION = ?,
+                        UPDATED_AT = CURRENT_TIMESTAMP()
+                    WHERE ID = ?
+                """,
+                [resolution_text, gap_key],
+            )
+            self.log_event(
+                entity_type="distillery_gap",
+                entity_id=gap_key,
+                action="resolve_distillery_gap",
+                before=before_data,
+                after={
+                    **before_data,
+                    "status": "RESOLVED",
+                    "resolution": resolution_text,
+                },
+                details={
+                    "catalog_version_id": clean_text(
+                        before_data.get("catalog_version_id")
+                    ),
+                    "workflow_id": clean_text(
+                        before_data.get("workflow_id")
+                    ),
+                },
+            )
+        return {
+            "id": gap_key,
+            "status": "RESOLVED",
+            "resolution": resolution_text,
         }
 
     def load_rules(self) -> list[dict[str, Any]]:
@@ -6312,6 +8669,7 @@ class SnowflakeRulesStore:
                         value:"description"::VARCHAR AS DESCRIPTION,
                         value:"action"::VARCHAR AS ACTION,
                         value:"if_in_stock_action"::VARCHAR AS IF_IN_STOCK_ACTION,
+                        value:"audit_action"::VARCHAR AS AUDIT_ACTION,
                         value:"buysmart_action"::VARCHAR AS BUYSMART_ACTION,
                         value:"rule_applied"::VARCHAR AS RULE_APPLIED,
                         COALESCE(value:"needs_review"::BOOLEAN, FALSE) AS NEEDS_REVIEW,
@@ -6340,6 +8698,7 @@ class SnowflakeRulesStore:
                     DESCRIPTION = source.DESCRIPTION,
                     ACTION = source.ACTION,
                     IF_IN_STOCK_ACTION = source.IF_IN_STOCK_ACTION,
+                    AUDIT_ACTION = source.AUDIT_ACTION,
                     BUYSMART_ACTION = source.BUYSMART_ACTION,
                     RULE_APPLIED = source.RULE_APPLIED,
                     NEEDS_REVIEW = source.NEEDS_REVIEW,
@@ -6353,7 +8712,7 @@ class SnowflakeRulesStore:
                 WHEN NOT MATCHED THEN INSERT (
                     ID, BATCH_ID, SOURCE_ROW_NUMBER, BUSINESS, REQUEST_TYPE,
                     CASE_NUMBER, VENDOR, DIN, MIN, DESCRIPTION, ACTION,
-                    IF_IN_STOCK_ACTION, BUYSMART_ACTION, RULE_APPLIED,
+                    IF_IN_STOCK_ACTION, AUDIT_ACTION, BUYSMART_ACTION, RULE_APPLIED,
                     NEEDS_REVIEW, VALIDATION_STATUS, EXCLUDED, QUEUE_BUCKET,
                     OUTCOME_REPORTING, STATUS, UPDATED_AT, ROW_JSON
                 ) VALUES (
@@ -6361,6 +8720,7 @@ class SnowflakeRulesStore:
                     source.BUSINESS, source.REQUEST_TYPE, source.CASE_NUMBER,
                     source.VENDOR, source.DIN, source.MIN, source.DESCRIPTION,
                     source.ACTION, source.IF_IN_STOCK_ACTION,
+                    source.AUDIT_ACTION,
                     source.BUYSMART_ACTION, source.RULE_APPLIED,
                     source.NEEDS_REVIEW, source.VALIDATION_STATUS,
                     source.EXCLUDED, source.QUEUE_BUCKET,
@@ -6745,6 +9105,106 @@ def selected_rows(rows: Sequence[Mapping[str, Any]], row_ids: Sequence[str] | No
     return [deepcopy(dict(row)) for row in rows if clean_text(row.get("id")) in selected]
 
 
+def workflow_rows_from_parsed(
+    parsed: ParsedWorkbook,
+    batch_id: str = "candidate-test",
+) -> list[dict[str, Any]]:
+    """Normalize an uploaded or live source without persisting a batch."""
+    timestamp = iso_now()
+    source_numbers = parsed.source_row_numbers or list(
+        range(2, len(parsed.rows) + 2)
+    )
+    return [
+        create_workflow_row(
+            batch_id,
+            raw_row,
+            source_row_number=(
+                source_numbers[index]
+                if index < len(source_numbers)
+                else index + 2
+            ),
+            now=timestamp,
+        )
+        for index, raw_row in enumerate(parsed.rows)
+    ]
+
+
+def compare_catalog_version(
+    store: SnowflakeRulesStore,
+    version_id: str,
+    source_rows: Sequence[Mapping[str, Any]],
+    *,
+    source_label: str,
+) -> dict[str, Any]:
+    """Run active and candidate catalogs in memory with zero persistence."""
+    version = store.get_catalog_version(version_id)
+    if version is None:
+        raise ValueError("The selected candidate catalog version no longer exists.")
+    workflow_id = clean_text(version.get("workflow_id"))
+    candidate_rules = store.load_catalog_version_rules(version_id)
+    if not candidate_rules:
+        raise ValueError("The selected candidate contains no versioned rules.")
+    active_rules = [
+        rule
+        for rule in store.load_rules()
+        if rule_workflow_id(rule) == workflow_id
+    ]
+    references = store.load_reference_lists()
+    active_rows, _, _ = execute_rows(
+        source_rows,
+        active_rules,
+        reference_lists=references,
+    )
+    candidate_rows, _, _ = execute_rows(
+        source_rows,
+        candidate_catalog_for_test(candidate_rules),
+        reference_lists=references,
+    )
+    records: list[dict[str, Any]] = []
+    same_count = 0
+    for source, active, candidate in zip(
+        source_rows,
+        active_rows,
+        candidate_rows,
+    ):
+        active_outcome = (
+            clean_text(active.get("action")),
+            clean_text(active.get("if_in_stock_action")),
+            clean_text(active.get("audit_action")),
+        )
+        candidate_outcome = (
+            clean_text(candidate.get("action")),
+            clean_text(candidate.get("if_in_stock_action")),
+            clean_text(candidate.get("audit_action")),
+        )
+        same = active_outcome == candidate_outcome
+        same_count += int(same)
+        records.append(
+            {
+                "Row": int(source.get("source_row_number") or 0),
+                "Case": clean_text(source.get("case_number")),
+                "Active ACTION": active_outcome[0],
+                "Candidate ACTION": candidate_outcome[0],
+                "Active If In Stock": active_outcome[1],
+                "Candidate If In Stock": candidate_outcome[1],
+                "Active Audit Action": active_outcome[2],
+                "Candidate Audit Action": candidate_outcome[2],
+                "Active Queue": clean_text(active.get("queue_bucket")),
+                "Candidate Queue": clean_text(candidate.get("queue_bucket")),
+                "Same atomic result": same,
+            }
+        )
+    return {
+        "catalog_version_id": version_id,
+        "workflow_id": workflow_id,
+        "source_label": source_label,
+        "row_count": len(records),
+        "same_count": same_count,
+        "different_count": len(records) - same_count,
+        "records": records,
+    }
+
+
 def run_batch(
     store: SnowflakeRulesStore,
     batch_id: str,
@@ -6834,6 +9294,7 @@ def apply_analyst_changes(
     editable_fields = {
         "action",
         "if_in_stock_action",
+        "audit_action",
         "buysmart_action",
         "needs_review",
         "analyst_notes",
@@ -6984,7 +9445,7 @@ def _runtime_exception_classification(exc: Exception, component: str) -> dict[st
         return {
             "code": "BACKEND_OBJECT_MISSING_OR_HIDDEN",
             "summary": "A required backend object is absent or not visible to the application owner role.",
-            "recommended_action": f"Verify the seven {TARGET_DATABASE}.{TARGET_SCHEMA}.{TABLE_PREFIX}_* tables and grant DML access to {TARGET_ROLE}. Use Settings → Verify backend tables for the exact failing object.",
+            "recommended_action": f"Verify the eleven {TARGET_DATABASE}.{TARGET_SCHEMA}.{TABLE_PREFIX}_* tables and grant DML access to {TARGET_ROLE}. Use Settings → Verify backend tables for the exact failing object.",
         }
     if "insufficient privileges" in lowered or "not authorized" in lowered or "access control error" in lowered:
         return {
@@ -7770,6 +10231,7 @@ def row_table_records(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]
             "Description": clean_text(row.get("description")),
             "ACTION": clean_text(row.get("action")),
             "If In Stock": clean_text(row.get("if_in_stock_action")),
+            "Audit Action": clean_text(row.get("audit_action")),
             "BuySmart": clean_text(row.get("buysmart_action")),
             "Outcome": clean_text(row.get("outcome_reporting")),
             "Queue": clean_text(row.get("queue_bucket")),
@@ -7899,6 +10361,7 @@ def normalized_preview_records(parsed: ParsedWorkbook, limit: int = 25) -> list[
                 "Usage": fields.get("usageQty"),
                 "ACTION": fields.get("upstreamAction"),
                 "If In Stock": fields.get("upstreamIfInStockAction"),
+                "Audit Action": fields.get("upstreamAuditAction"),
                 "BuySmart": fields.get("upstreamBuysmartAction"),
             }
         )
@@ -8544,7 +11007,7 @@ def render_workbench_page(store: SnowflakeRulesStore, selected_batch: Mapping[st
     )
     with decision_tab:
         with st.form(f"row_override_{selected_row_id}"):
-            first = st.columns(3)
+            first = st.columns(4)
             action_options = options_with_current(ACTION_OPTIONS, selected_row.get("action"))
             action = first[0].selectbox(
                 "ACTION",
@@ -8557,8 +11020,21 @@ def render_workbench_page(store: SnowflakeRulesStore, selected_batch: Mapping[st
                 if_stock_options,
                 index=if_stock_options.index(clean_text(selected_row.get("if_in_stock_action"))) if clean_text(selected_row.get("if_in_stock_action")) in if_stock_options else 0,
             )
+            audit_options = options_with_current(
+                AUDIT_ACTION_OPTIONS,
+                selected_row.get("audit_action"),
+            )
+            audit_action = first[2].selectbox(
+                "Audit Action",
+                audit_options,
+                index=(
+                    audit_options.index(clean_text(selected_row.get("audit_action")))
+                    if clean_text(selected_row.get("audit_action")) in audit_options
+                    else 0
+                ),
+            )
             buysmart_options = options_with_current(BUYSMART_OPTIONS, selected_row.get("buysmart_action"))
-            buysmart = first[2].selectbox(
+            buysmart = first[3].selectbox(
                 "BuySmart Action",
                 buysmart_options,
                 index=buysmart_options.index(clean_text(selected_row.get("buysmart_action"))) if clean_text(selected_row.get("buysmart_action")) in buysmart_options else 0,
@@ -8592,6 +11068,7 @@ def render_workbench_page(store: SnowflakeRulesStore, selected_batch: Mapping[st
                 changes = {
                     "action": action,
                     "if_in_stock_action": if_stock,
+                    "audit_action": audit_action,
                     "buysmart_action": buysmart,
                     "needs_review": needs_review,
                     "excluded": excluded,
@@ -8661,6 +11138,7 @@ def render_workbench_page(store: SnowflakeRulesStore, selected_batch: Mapping[st
         decision_record = {
             "ACTION": clean_text(selected_row.get("action")),
             "If In Stock": clean_text(selected_row.get("if_in_stock_action")),
+            "Audit Action": clean_text(selected_row.get("audit_action")),
             "BuySmart": clean_text(selected_row.get("buysmart_action")),
             "Outcome": clean_text(selected_row.get("outcome_reporting")),
             "Queue": clean_text(selected_row.get("queue_bucket")),
@@ -9231,7 +11709,7 @@ def render_rule_builder(store: SnowflakeRulesStore, rules: Sequence[Mapping[str,
         )
 
 
-def render_rules_distillery_page(store: SnowflakeRulesStore) -> None:
+def render_rules_distillery_page_legacy(store: SnowflakeRulesStore) -> None:
     render_page_header(
         "Rules Distillery",
         (
@@ -9451,6 +11929,816 @@ def render_rules_distillery_page(store: SnowflakeRulesStore) -> None:
             )
 
 
+def render_rules_distillery_page(store: SnowflakeRulesStore) -> None:
+    render_page_header(
+        "Rules Distillery",
+        (
+            "Reconstruct literal business filters from every matching dated "
+            "BEFORE/AFTER pair, then test an immutable candidate before activation."
+        ),
+        kicker="Mechanized Rule Discovery",
+    )
+    st.info(
+        "A Distillery run never overwrites active rules or stored workflow rows. "
+        "Only an explicit activation materializes one complete workflow version; "
+        "every prior version remains available for exact rollback."
+    )
+    controls = st.columns([2, 1])
+    profile_id = controls[0].selectbox(
+        "Ruleset profile",
+        list(DISTILLERY_PROFILES),
+        format_func=lambda value: clean_text(
+            DISTILLERY_PROFILES[value].get("description")
+        ),
+        key="literal_distillery_profile",
+    )
+    run_holdouts = controls[1].checkbox(
+        "Leave-one-date-out validation",
+        value=False,
+        key="literal_distillery_holdouts",
+        help=(
+            "Optional and compute-intensive: retrains reusable filters ten "
+            "times, each with one date withheld from discovery."
+        ),
+    )
+    try:
+        persisted_aliases = store.load_outcome_aliases(profile_id)
+    except Exception as exc:
+        persisted_aliases = {}
+        render_actionable_exception(
+            "Outcome aliases could not be loaded.",
+            exc,
+            component="Distillery outcome aliases",
+            context={
+                "profile_id": profile_id,
+                "required_table": store.table("outcome_aliases"),
+            },
+        )
+
+    approval_key = f"_literal_rule_approvals_{profile_id}"
+    approved_signatures = [
+        clean_text(value)
+        for value in st.session_state.get(approval_key, [])
+        if clean_text(value)
+    ]
+    upload_columns = st.columns(2)
+    with upload_columns[0]:
+        before_upload = st.file_uploader(
+            "BEFORE evidence",
+            type=["zip", *sorted(DISTILLERY_SUPPORTED_EXTENSIONS)],
+            key="literal_distillery_before",
+            help="Dated member basenames are paired with the AFTER collection.",
+        )
+    with upload_columns[1]:
+        after_upload = st.file_uploader(
+            "AFTER evidence",
+            type=["zip", *sorted(DISTILLERY_SUPPORTED_EXTENSIONS)],
+            key="literal_distillery_after",
+            help=(
+                "ACTION, If In Stock: Action, and Audit Action form one "
+                "atomic final result."
+            ),
+        )
+
+    def execute_distillery(
+        signatures: Sequence[str],
+    ) -> dict[str, Any]:
+        if before_upload is None or after_upload is None:
+            raise ValueError("Both BEFORE and AFTER evidence are required.")
+        return run_rules_distillery(
+            profile_id=profile_id,
+            before_file_name=clean_text(before_upload.name),
+            before_bytes=before_upload.getvalue(),
+            after_file_name=clean_text(after_upload.name),
+            after_bytes=after_upload.getvalue(),
+            run_holdouts=run_holdouts,
+            outcome_aliases=persisted_aliases,
+            approved_rule_signatures=signatures,
+        )
+
+    if st.button(
+        "Reconstruct literal filters",
+        type="primary",
+        disabled=before_upload is None or after_upload is None,
+        key="literal_distillery_run",
+    ):
+        try:
+            with st.spinner(
+                "Pairing every date, reconstructing pure filters, minimizing "
+                "logic, and validating all three outcomes..."
+            ):
+                result = execute_distillery(approved_signatures)
+            st.session_state["_literal_distillery_result"] = result
+            report = result["report"]
+            set_flash(
+                (
+                    f"Distillery run {result['run_id']} completed: "
+                    f"{report['validation']['exact_count']:,}/"
+                    f"{report['validation']['row_count']:,} exact rows and "
+                    f"{report['rules']['total']:,} literal filters."
+                ),
+                "success"
+                if result.get("deployment_eligible")
+                else "warning",
+            )
+            safe_rerun()
+        except Exception as exc:
+            render_actionable_exception(
+                "Rules Distillery could not complete this evidence run.",
+                exc,
+                component="Rules Distillery",
+                context={
+                    "profile_id": profile_id,
+                    "before_file": clean_text(
+                        getattr(before_upload, "name", "")
+                    ),
+                    "after_file": clean_text(
+                        getattr(after_upload, "name", "")
+                    ),
+                },
+            )
+
+    result = st.session_state.get("_literal_distillery_result")
+    if (
+        isinstance(result, Mapping)
+        and clean_text(result.get("profile_id")) == profile_id
+    ):
+        report = result.get("report") or {}
+        matching = report.get("matching") or {}
+        rules = report.get("rules") or {}
+        validation = report.get("validation") or {}
+        holdout = report.get("holdout") or {}
+        gate = report.get("deployment_gate") or {}
+        metrics = st.columns(8)
+        metrics[0].metric(
+            "Logical rows", f"{int(matching.get('pairs') or 0):,}"
+        )
+        metrics[1].metric(
+            "Unmatched", f"{int(matching.get('unmatched') or 0):,}"
+        )
+        metrics[2].metric(
+            "Reusable", f"{int(rules.get('reusable') or 0):,}"
+        )
+        metrics[3].metric(
+            "One-date", f"{int(rules.get('one_date') or 0):,}"
+        )
+        metrics[4].metric(
+            "Gaps", f"{int((report.get('gaps') or {}).get('count') or 0):,}"
+        )
+        metrics[5].metric(
+            "Conflicts",
+            f"{int((report.get('conflicts') or {}).get('count') or 0):,}",
+        )
+        metrics[6].metric(
+            "Corpus parity",
+            f"{float(validation.get('accuracy') or 0.0):.2%}",
+        )
+        metrics[7].metric(
+            "Holdout",
+            (
+                f"{float(holdout.get('mean_accuracy') or 0.0):.2%}"
+                if clean_text(holdout.get("strategy")) != "not-run"
+                else "Not run"
+            ),
+        )
+        if bool_value(gate.get("eligible")):
+            st.success(
+                "Activation gate passed: exact three-field parity and zero "
+                "unmatched rows, contradictions, gaps, conflicts, pending "
+                "aliases, or pending one-date approvals."
+            )
+        else:
+            observed = gate.get("observed") or {}
+            failures = [
+                f"{key.replace('_', ' ')}={value}"
+                for key, value in observed.items()
+                if (
+                    (key == "corpus_accuracy" and float(value or 0) != 1.0)
+                    or (key != "corpus_accuracy" and int(value or 0) != 0)
+                )
+            ]
+            st.error(
+                "Activation is blocked. "
+                + (", ".join(failures) if failures else "Gate requirements failed.")
+            )
+
+        labels = report.get("labels") or {}
+        alias_registry = labels.get("alias_registry") or {}
+        st.markdown("#### Outcome aliases")
+        st.caption(
+            "Case and spacing normalize automatically. For a near-match, set "
+            "both raw values to the same canonical value to merge them, or "
+            "leave them distinct and save to record that review decision."
+        )
+        alias_entries = alias_registry.get("entries") or []
+        alias_frame = pd.DataFrame(
+            [
+                {
+                    "Field": clean_text(entry.get("field_name")),
+                    "Raw value": clean_text(entry.get("raw_value")),
+                    "Canonical value": clean_text(
+                        entry.get("canonical_value")
+                    ),
+                    "Rows": int(entry.get("row_count") or 0),
+                    "Status": clean_text(entry.get("status")),
+                }
+                for entry in alias_entries
+            ]
+        )
+        edited_aliases = st.data_editor(
+            alias_frame,
+            disabled=["Field", "Raw value", "Rows", "Status"],
+            hide_index=True,
+            use_container_width=True,
+            key=f"literal_alias_editor_{result.get('run_id')}",
+        )
+        suggestions = alias_registry.get("suggestions") or []
+        if suggestions:
+            st.warning(
+                f"{len(suggestions):,} near-match alias decision(s) require review."
+            )
+            dataframe(
+                pd.DataFrame(
+                    [
+                        {
+                            "Field": item.get("field_name"),
+                            "Value A": item.get("left_value"),
+                            "Value B": item.get("right_value"),
+                            "Similarity": item.get("similarity"),
+                        }
+                        for item in suggestions
+                    ]
+                )
+            )
+        if st.button(
+            "Save reviewed outcome aliases",
+            key="literal_save_aliases",
+            disabled=alias_frame.empty,
+        ):
+            try:
+                alias_values = [
+                    {
+                        "field_name": clean_text(row.get("Field")),
+                        "raw_value": clean_text(row.get("Raw value")),
+                        "canonical_value": clean_text(
+                            row.get("Canonical value")
+                        ),
+                    }
+                    for row in edited_aliases.to_dict(orient="records")
+                ]
+                saved_count = store.save_outcome_aliases(
+                    profile_id,
+                    alias_values,
+                )
+                st.session_state.pop("_literal_distillery_result", None)
+                set_flash(
+                    f"Saved {saved_count:,} reviewed aliases. Reconstruct the "
+                    "filters to apply them."
+                )
+                safe_rerun()
+            except Exception as exc:
+                render_actionable_exception(
+                    "Reviewed outcome aliases could not be saved.",
+                    exc,
+                    component="Distillery outcome aliases",
+                    context={"profile_id": profile_id},
+                )
+
+        st.markdown("#### Outcome permutations by date")
+        permutation_records: list[dict[str, Any]] = []
+        for view_label, key in (
+            ("Raw", "raw_permutations_by_date"),
+            ("Canonical", "canonical_permutations_by_date"),
+        ):
+            for source_group, values in (labels.get(key) or {}).items():
+                for outcome_json, count in (
+                    (values or {}).get("counts") or {}
+                ).items():
+                    outcome = normalize_persisted_json(outcome_json, {})
+                    permutation_records.append(
+                        {
+                            "Date / source": source_group,
+                            "View": view_label,
+                            "ACTION": clean_text(
+                                (outcome or {}).get("action")
+                            ),
+                            "If In Stock: Action": clean_text(
+                                (outcome or {}).get("if_in_stock_action")
+                            ),
+                            "Audit Action": clean_text(
+                                (outcome or {}).get("audit_action")
+                            ),
+                            "Rows": int(count or 0),
+                        }
+                    )
+        if permutation_records:
+            dataframe(pd.DataFrame(permutation_records), height=520)
+
+        catalog = result.get("catalog") or []
+        rule_records: list[dict[str, Any]] = []
+        for rule in catalog:
+            source = rule.get("source") or {}
+            outcome = source.get("outcome") or {}
+            rule_records.append(
+                {
+                    "Rule": clean_text(rule.get("name")),
+                    "Kind": clean_text(source.get("distilled_rule_kind")),
+                    "Filter logic": clean_text(source.get("filter_logic")),
+                    "ACTION": clean_text(outcome.get("action")),
+                    "If In Stock: Action": clean_text(
+                        outcome.get("if_in_stock_action")
+                    ),
+                    "Audit Action": clean_text(outcome.get("audit_action")),
+                    "Supporting dates": ", ".join(
+                        source.get("source_groups") or []
+                    ),
+                    "Covered rows": int(source.get("support") or 0),
+                    "Approval": (
+                        "Approved"
+                        if bool_value(source.get("approved"))
+                        else "Required"
+                    ),
+                    "Logic signature": clean_text(
+                        source.get("logic_signature")
+                    ),
+                }
+            )
+        reusable_records = [
+            row for row in rule_records if row["Kind"] == "reusable"
+        ]
+        one_date_records = [
+            row for row in rule_records if row["Kind"] == "one_date"
+        ]
+        rules_tabs = st.tabs(
+            [
+                f"Reusable filters ({len(reusable_records)})",
+                f"One-date review ({len(one_date_records)})",
+                f"Gaps ({len(result.get('gaps') or [])})",
+                f"Conflicts ({len(result.get('conflicts') or [])})",
+            ]
+        )
+        with rules_tabs[0]:
+            if reusable_records:
+                dataframe(pd.DataFrame(reusable_records), height=560)
+            else:
+                st.caption("No reusable filters were discovered.")
+        with rules_tabs[1]:
+            if one_date_records:
+                dataframe(pd.DataFrame(one_date_records), height=480)
+                pending = report.get("pending_rule_approvals") or []
+                pending_by_signature = {
+                    clean_text(item.get("logic_signature")): item
+                    for item in pending
+                }
+                selected_approvals = st.multiselect(
+                    "Approve one-date filters",
+                    list(pending_by_signature),
+                    format_func=lambda value: clean_text(
+                        pending_by_signature[value].get("name")
+                    ),
+                    key=f"literal_pending_rules_{result.get('run_id')}",
+                )
+                if st.button(
+                    "Rebuild candidate with selected approvals",
+                    disabled=not selected_approvals,
+                    key="literal_apply_rule_approvals",
+                ):
+                    try:
+                        combined = sorted(
+                            set(approved_signatures) | set(selected_approvals)
+                        )
+                        st.session_state[approval_key] = combined
+                        with st.spinner(
+                            "Revalidating the complete corpus with approvals..."
+                        ):
+                            rebuilt = execute_distillery(combined)
+                        st.session_state["_literal_distillery_result"] = rebuilt
+                        set_flash(
+                            f"Applied {len(combined):,} explicit one-date "
+                            "approval(s) and rebuilt the candidate."
+                        )
+                        safe_rerun()
+                    except Exception as exc:
+                        render_actionable_exception(
+                            "The candidate could not be rebuilt with approvals.",
+                            exc,
+                            component="Distillery one-date approval",
+                            context={"profile_id": profile_id},
+                        )
+            else:
+                st.caption("No one-date filters require approval.")
+        with rules_tabs[2]:
+            gaps = result.get("gaps") or []
+            if gaps:
+                dataframe(pd.DataFrame(gaps), height=560)
+            else:
+                st.success("No unexplained rows remain.")
+        with rules_tabs[3]:
+            conflicts = result.get("conflicts") or []
+            if conflicts:
+                dataframe(pd.DataFrame(conflicts), height=560)
+            else:
+                st.success("No conflicting filters remain.")
+
+        folds = holdout.get("folds") or {}
+        if isinstance(folds, Mapping) and folds:
+            with st.expander("Leave-one-date-out results", expanded=False):
+                dataframe(
+                    pd.DataFrame(
+                        [
+                            {
+                                "Date / source": group,
+                                "Testing rows": int(
+                                    values.get("testing_rows") or 0
+                                ),
+                                "Reusable rules": int(
+                                    values.get("rule_count") or 0
+                                ),
+                                "Accuracy": float(
+                                    values.get("accuracy") or 0.0
+                                ),
+                                "Exact": int(values.get("exact") or 0),
+                                "Uncovered": int(
+                                    values.get("uncovered") or 0
+                                ),
+                                "Mismatched": int(
+                                    values.get("mismatched") or 0
+                                ),
+                            }
+                            for group, values in folds.items()
+                        ]
+                    )
+                )
+        with st.expander("Complete Distillery report", expanded=False):
+            st.json(report)
+            st.download_button(
+                "Download validation report",
+                data=json_dumps(report, pretty=True),
+                file_name=(
+                    "one_engine_distillery_"
+                    f"{clean_text(result.get('run_id'))}.json"
+                ),
+                mime="application/json",
+                key="literal_distillery_report_download",
+            )
+
+        st.markdown("#### Save immutable candidate")
+        st.caption(
+            "Saving creates a versioned sandbox. It does not change active "
+            "rules, execute a batch, or update workflow rows."
+        )
+        if st.button(
+            "Save candidate version to Snowflake",
+            key="literal_save_candidate",
+            disabled=not catalog,
+        ):
+            try:
+                version = store.save_catalog_candidate(
+                    catalog,
+                    report,
+                    result.get("gaps") or [],
+                )
+                st.session_state["_literal_selected_version"] = clean_text(
+                    version.get("id")
+                )
+                set_flash(
+                    f"Saved immutable {profile_id} catalog version "
+                    f"{int(version.get('version_number') or 0)}."
+                )
+                safe_rerun()
+            except Exception as exc:
+                render_actionable_exception(
+                    "The immutable candidate could not be saved.",
+                    exc,
+                    component="Distillery catalog version",
+                    context={
+                        "profile_id": profile_id,
+                        "run_id": clean_text(result.get("run_id")),
+                    },
+                )
+    else:
+        st.caption(
+            "Upload paired evidence and reconstruct literal filters. Existing "
+            "saved versions remain available below."
+        )
+
+    st.divider()
+    st.markdown("### Candidate testing, activation, and rollback")
+    try:
+        versions = store.list_catalog_versions(profile_id)
+    except Exception as exc:
+        render_actionable_exception(
+            "Catalog versions could not be loaded.",
+            exc,
+            component="Distillery catalog versions",
+            context={
+                "profile_id": profile_id,
+                "required_table": store.table("catalog_versions"),
+            },
+        )
+        return
+    if not versions:
+        st.caption(
+            "No catalog versions exist yet. Saving a candidate first captures "
+            "the current Product Request catalog as the legacy rollback version."
+        )
+        return
+    dataframe(
+        pd.DataFrame(
+            [
+                {
+                    "Version": int(item.get("version_number") or 0),
+                    "Status": clean_text(item.get("status")),
+                    "Rules": int(item.get("rule_count") or 0),
+                    "Gaps": int(item.get("gap_count") or 0),
+                    "Eligible": bool_value(item.get("deployment_eligible")),
+                    "Created": timestamp_text(item.get("created_at")),
+                    "Activated": timestamp_text(item.get("activated_at")),
+                    "ID": clean_text(item.get("id")),
+                }
+                for item in versions
+            ]
+        ),
+        height=min(430, 38 + len(versions) * 35),
+    )
+    version_by_id = {
+        clean_text(item.get("id")): item for item in versions
+    }
+    preferred_version = clean_text(
+        st.session_state.get("_literal_selected_version")
+    )
+    version_ids = list(version_by_id)
+    selected_index = (
+        version_ids.index(preferred_version)
+        if preferred_version in version_ids
+        else 0
+    )
+    selected_version_id = st.selectbox(
+        "Catalog version",
+        version_ids,
+        index=selected_index,
+        format_func=lambda value: (
+            f"v{int(version_by_id[value].get('version_number') or 0)} - "
+            f"{clean_text(version_by_id[value].get('status'))} - {value[:8]}"
+        ),
+        key="literal_version_select",
+    )
+    selected_version = version_by_id[selected_version_id]
+
+    test_tab, activation_tab, gap_tab, history_tab = st.tabs(
+        [
+            "Isolated candidate test",
+            "Activate / rollback",
+            "Persistent gaps",
+            "Audit history",
+        ]
+    )
+    with test_tab:
+        st.caption(
+            "Active and selected catalogs run against cloned in-memory rows. "
+            "No run, result, batch, or workflow-row record is written."
+        )
+        test_source = st.radio(
+            "Test data",
+            [
+                "Existing batch",
+                "Upload Product Request file",
+                "Live Product Request data",
+            ],
+            horizontal=True,
+            key="literal_test_source",
+        )
+        batches: list[dict[str, Any]] = []
+        selected_batch_id = ""
+        candidate_upload = None
+        if test_source == "Existing batch":
+            batches = store.list_batches()
+            if batches:
+                selected_batch_id = st.selectbox(
+                    "Batch",
+                    [clean_text(item.get("id")) for item in batches],
+                    format_func=lambda value: next(
+                        (
+                            f"{clean_text(item.get('name'))} - "
+                            f"{int(item.get('row_count') or 0):,} rows"
+                        )
+                        for item in batches
+                        if clean_text(item.get("id")) == value
+                    ),
+                    key="literal_test_batch",
+                )
+            else:
+                st.caption("No stored batches are available.")
+        elif test_source == "Upload Product Request file":
+            candidate_upload = st.file_uploader(
+                "Product Request test file",
+                type=["csv", "txt", "tsv", "xlsx", "xlsm"],
+                key="literal_candidate_test_upload",
+            )
+        else:
+            st.caption(
+                f"Reads {TARGET_DATABASE}.{TARGET_SCHEMA}."
+                f"{LIVE_PRODUCT_REQUEST_VIEW} once for this comparison."
+            )
+        can_test = (
+            bool(selected_batch_id)
+            if test_source == "Existing batch"
+            else candidate_upload is not None
+            if test_source == "Upload Product Request file"
+            else True
+        )
+        if st.button(
+            "Compare active vs selected version",
+            type="primary",
+            disabled=not can_test,
+            key="literal_compare_candidate",
+        ):
+            try:
+                if test_source == "Existing batch":
+                    source_rows = store.load_rows(selected_batch_id)
+                    source_label = next(
+                        clean_text(item.get("name"))
+                        for item in batches
+                        if clean_text(item.get("id")) == selected_batch_id
+                    )
+                elif test_source == "Upload Product Request file":
+                    parsed = parse_source_workbook(
+                        clean_text(candidate_upload.name),
+                        candidate_upload.getvalue(),
+                    )
+                    source_rows = workflow_rows_from_parsed(parsed)
+                    source_label = clean_text(candidate_upload.name)
+                else:
+                    parsed, _, metadata = store.load_live_product_request_data()
+                    source_rows = workflow_rows_from_parsed(
+                        parsed,
+                        "candidate-live-test",
+                    )
+                    source_label = clean_text(metadata.get("source_view"))
+                comparison = compare_catalog_version(
+                    store,
+                    selected_version_id,
+                    source_rows,
+                    source_label=source_label,
+                )
+                st.session_state["_literal_distillery_comparison"] = comparison
+                set_flash(
+                    f"Compared {comparison['row_count']:,} rows without "
+                    "changing active rules or stored data."
+                )
+                safe_rerun()
+            except Exception as exc:
+                render_actionable_exception(
+                    "The isolated catalog comparison failed.",
+                    exc,
+                    component="Distillery candidate test",
+                    context={
+                        "catalog_version_id": selected_version_id,
+                        "test_source": test_source,
+                    },
+                )
+        comparison = st.session_state.get("_literal_distillery_comparison")
+        if (
+            isinstance(comparison, Mapping)
+            and clean_text(comparison.get("catalog_version_id"))
+            == selected_version_id
+        ):
+            comparison_metrics = st.columns(3)
+            comparison_metrics[0].metric(
+                "Rows", f"{int(comparison.get('row_count') or 0):,}"
+            )
+            comparison_metrics[1].metric(
+                "Same atomic result",
+                f"{int(comparison.get('same_count') or 0):,}",
+            )
+            comparison_metrics[2].metric(
+                "Different",
+                f"{int(comparison.get('different_count') or 0):,}",
+            )
+            records = comparison.get("records") or []
+            differences = [
+                row
+                for row in records
+                if not bool_value(row.get("Same atomic result"))
+            ]
+            dataframe(pd.DataFrame(differences or records), height=560)
+    with activation_tab:
+        status = clean_text(selected_version.get("status")).upper()
+        eligible = bool_value(selected_version.get("deployment_eligible"))
+        if status == "ACTIVE":
+            st.success("This is the active materialized workflow catalog.")
+        else:
+            action_word = "Roll back" if status == "RETIRED" else "Activate"
+            confirmation = st.checkbox(
+                (
+                    f"I confirm {action_word.lower()} to Product Request "
+                    f"catalog version "
+                    f"{int(selected_version.get('version_number') or 0)}."
+                ),
+                key=f"literal_activate_confirm_{selected_version_id}",
+            )
+            if status == "CANDIDATE" and not eligible:
+                st.error(
+                    "This candidate cannot activate because its saved "
+                    "Distillery gate was not eligible."
+                )
+            if st.button(
+                f"{action_word} selected catalog version",
+                disabled=not confirmation
+                or (status == "CANDIDATE" and not eligible),
+                key=f"literal_activate_{selected_version_id}",
+            ):
+                try:
+                    activated = store.activate_catalog_version(
+                        selected_version_id
+                    )
+                    set_flash(
+                        f"Product Request catalog version "
+                        f"{int(activated.get('version_number') or 0)} is active."
+                    )
+                    safe_rerun()
+                except Exception as exc:
+                    render_actionable_exception(
+                        "The catalog version could not be activated.",
+                        exc,
+                        component="Distillery activation",
+                        context={
+                            "catalog_version_id": selected_version_id,
+                            "status": status,
+                        },
+                    )
+    with gap_tab:
+        version_gaps = store.list_distillery_gaps(selected_version_id)
+        if version_gaps:
+            dataframe(pd.DataFrame(version_gaps), height=520)
+            open_gaps = [
+                item
+                for item in version_gaps
+                if clean_text(item.get("status")).upper() != "RESOLVED"
+            ]
+            if open_gaps:
+                gap_by_id = {
+                    clean_text(item.get("id")): item for item in open_gaps
+                }
+                selected_gap_id = st.selectbox(
+                    "Open gap",
+                    list(gap_by_id),
+                    format_func=lambda value: (
+                        f"{clean_text(gap_by_id[value].get('source_group'))} - "
+                        f"{clean_text(gap_by_id[value].get('pair_id'))}"
+                    ),
+                    key=f"literal_gap_select_{selected_version_id}",
+                )
+                resolution = st.text_area(
+                    "Resolution note",
+                    help=(
+                        "Record why this evidence is explained or excluded. "
+                        "Then rebuild the Distillery candidate; resolving a "
+                        "gap never silently changes immutable rules."
+                    ),
+                    key=f"literal_gap_resolution_{selected_gap_id}",
+                )
+                if st.button(
+                    "Resolve selected gap",
+                    disabled=not clean_text(resolution),
+                    key=f"literal_gap_resolve_{selected_gap_id}",
+                ):
+                    try:
+                        store.resolve_distillery_gap(
+                            selected_gap_id,
+                            resolution,
+                        )
+                        set_flash(
+                            "Resolved the selected gap. Rebuild a candidate "
+                            "before activation."
+                        )
+                        safe_rerun()
+                    except Exception as exc:
+                        render_actionable_exception(
+                            "The Distillery gap could not be resolved.",
+                            exc,
+                            component="Distillery gap queue",
+                            context={
+                                "gap_id": selected_gap_id,
+                                "catalog_version_id": selected_version_id,
+                            },
+                        )
+            else:
+                st.success("Every persisted gap in this version is resolved.")
+        else:
+            st.success("This catalog version has no persisted gaps.")
+    with history_tab:
+        events = [
+            event
+            for event in store.list_audit(limit=500)
+            if clean_text(event.get("entity_type")) == "catalog_version"
+        ]
+        if events:
+            dataframe(pd.DataFrame(audit_table_records(events)), height=560)
+        else:
+            st.caption("No catalog-version audit events have been recorded.")
+
+
 def render_rules_catalog_page(store: SnowflakeRulesStore) -> None:
     render_page_header(
         "Rules Catalog",
@@ -9580,6 +12868,7 @@ def simulation_decision_record(row: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "ACTION": clean_text(row.get("action")),
         "If In Stock": clean_text(row.get("if_in_stock_action")),
+        "Audit Action": clean_text(row.get("audit_action")),
         "BuySmart": clean_text(row.get("buysmart_action")),
         "Outcome": clean_text(row.get("outcome_reporting")),
         "Queue": clean_text(row.get("queue_bucket")),

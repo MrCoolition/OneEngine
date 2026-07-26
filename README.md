@@ -55,10 +55,9 @@ Streamlit widgets keep their Snowflake behavior and receive the Foodbuy visual
 contract through CSS, preserving the one-Python-file deployment model.
 
 There are no generated catalog files, profile JSON files, loader scripts, or
-runtime Python packages to deploy. Candidate catalogs exist only in the current
-browser session until an authorized user promotes them. Promotion writes the
-rules to `COMPLIANCE_RULES_RULES` and the complete validation report to
-`COMPLIANCE_RULES_AUDIT_EVENTS`.
+runtime Python packages to deploy. Rules, aliases, candidates, gaps, immutable
+catalog versions, and audit history are Snowflake data. An isolated candidate
+test never changes active rules or stored workflow rows.
 
 ## Product Request evidence result
 
@@ -71,21 +70,14 @@ rejects two physically present but completely empty spreadsheet rows, leaving
 | Logical BEFORE/AFTER pairs | 6,920 / 6,920 |
 | Unmatched rows | 0 |
 | Ambiguous duplicate alignments | 2 |
-| Contradictory identical BEFORE states | 0 |
-| Generated rules | 169 |
-| Exact accumulated-corpus parity | 100.00% |
-| Mean leave-one-source-file-out accuracy | 69.37% |
+| Atomic AFTER outcome fields | 3 |
 
-The catalog contains:
-
-- 112 reusable general rules, promoted only from 100%-pure leaves with at
-  least three supporting rows.
-- 57 evidence rules that deterministically close the residual states already
-  observed in reviewed evidence.
-
-Historical parity and unseen-file generalization are reported separately. The
-Distillery's leave-one-source-group-out validation is the honest estimate for
-a new daily file; evidence rules are never allowed to disguise that score.
+Every run recomputes filter coverage, aliases, gaps, conflicts, corpus parity,
+and optional leave-one-date-out validation. No fixed generated catalog is kept
+in this repository, and ONE ENGINE does not manufacture row-specific fallback
+rules to claim parity. A corpus that still contains unexplained decisions is
+saved as an ineligible candidate with persistent gaps; activation remains
+blocked until those gaps are resolved with governed business logic.
 
 ## Rules Distillery workflow
 
@@ -93,17 +85,27 @@ a new daily file; evidence rules are never allowed to disguise that score.
 2. Select the workflow profile.
 3. Upload the accumulated BEFORE and AFTER files. A ZIP can contain many
    matching source files.
-4. Run alignment, rule induction, residual closure, corpus validation, and
-   optional source-group holdouts.
-5. Review the validation report and deployment gate.
-6. Confirm promotion. ONE ENGINE atomically retires obsolete rules for that
-   workflow and upserts the new catalog into Snowflake.
+4. Review raw and canonical permutations for the atomic result:
+   `ACTION`, `If In Stock: Action`, and `Audit Action`.
+5. Review uncertain aliases, reusable filters, one-date filters, conflicts,
+   and persistent gaps.
+6. Save an immutable candidate version.
+7. Compare active versus candidate results against an uploaded file, live
+   Product Request data, or an existing batch. This comparison is read-only.
+8. Activate an eligible candidate, or roll back to any retained version.
 
 The promotion gate requires:
 
 - 100% exact accumulated-corpus parity;
 - zero unmatched rows;
-- zero contradictory identical input states.
+- zero contradictory identical input states;
+- zero filter conflicts and unresolved gaps;
+- zero pending outcome-alias reviews;
+- explicit approval for every filter supported by only one date;
+- zero SHA, Case#, pair-ID, or exact-row predicates.
+
+SHA-256 values remain source and evidence lineage metadata only. They are not
+available in the runtime predicate context and cannot route a Product Request.
 
 The current adapters accept XLSX/XLSM, CSV/TSV/text, JSON/JSONL/NDJSON,
 Parquet, Feather, and ZIP collections. Rules are always scoped with
@@ -113,8 +115,8 @@ Product Request rows.
 ## Long-game extension model
 
 ONE ENGINE is one runtime, not one hard-coded workflow. Each workflow has an
-internal profile that defines aliases, output fields, identity strategies,
-similarity fields, induction fields, validation grouping, and feature
+internal profile that defines source adapters, aliases, atomic outcome fields,
+governed predicate fields, matching strategy, validation grouping, and feature
 projection.
 
 Under the single-file Snowflake constraint, add the next workflow directly in
@@ -132,7 +134,7 @@ The evidence and resulting catalogs remain database data, never source files.
 ## Snowflake backend
 
 [`snowflake/compliance_rules_backend.sql`](snowflake/compliance_rules_backend.sql)
-provisions the seven-table backend:
+provisions the eleven-table backend:
 
 - `COMPLIANCE_RULES_BATCHES`
 - `COMPLIANCE_RULES_WORKFLOW_ROWS`
@@ -141,9 +143,15 @@ provisions the seven-table backend:
 - `COMPLIANCE_RULES_ROW_RESULTS`
 - `COMPLIANCE_RULES_AUDIT_EVENTS`
 - `COMPLIANCE_RULES_REFERENCE_LISTS`
+- `COMPLIANCE_RULES_CATALOG_VERSIONS`
+- `COMPLIANCE_RULES_CATALOG_VERSION_RULES`
+- `COMPLIANCE_RULES_DISTILLERY_GAPS`
+- `COMPLIANCE_RULES_OUTCOME_ALIASES`
 
-The app performs no runtime DDL. Use **Settings → Verify backend tables** after
-deployment.
+The script also migrates existing `COMPLIANCE_RULES_WORKFLOW_ROWS` tables with
+the `AUDIT_ACTION` column. The app performs no runtime DDL. Run the backend SQL
+before deploying this app version, then use **Settings → Verify backend
+tables**.
 
 ### Live Product Request source
 
@@ -172,7 +180,8 @@ py -3 -m unittest discover -s tests -v
 ```
 
 The contracts verify the embedded seed catalog, application self-check,
-complete evidence alignment, compact distilled catalog, rule scoping, and exact
-execution of all 6,920 expected decisions through the actual Streamlit runtime.
+complete 10-date/6,920-row evidence alignment, the three-field atomic outcome,
+safe alias review, literal-filter minimization, identity-predicate exclusion,
+blank clearing, candidate isolation, and the versioned Snowflake contract.
 
 Do not commit `.env` or `.streamlit/secrets.toml`.

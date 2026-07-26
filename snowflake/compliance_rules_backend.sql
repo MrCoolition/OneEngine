@@ -5,9 +5,9 @@
 -- Target database:  FOODBUY_MASALA_PROD
 -- Target schema:    COMPLIANCE_LAB
 --
--- This script is idempotent. It creates the seven persistence tables required
--- by rules_engine_streamlit_snowpark.py and seeds the bundled local-vendor
--- reference list. The Python application seeds the embedded DAF rule catalog.
+-- This script is idempotent. It creates the eleven persistence tables required
+-- by streamlit_app.py and seeds the bundled local-vendor reference list. The
+-- Python application seeds the embedded DAF rule catalog.
 -- ============================================================================
 
 USE ROLE FOODBUY_AXIOM_COMPLIANCE_PROD;
@@ -62,6 +62,7 @@ CREATE TABLE IF NOT EXISTS FOODBUY_MASALA_PROD.COMPLIANCE_LAB.COMPLIANCE_RULES_W
     DESCRIPTION         VARCHAR,
     ACTION              VARCHAR,
     IF_IN_STOCK_ACTION  VARCHAR,
+    AUDIT_ACTION        VARCHAR,
     BUYSMART_ACTION     VARCHAR,
     RULE_APPLIED        VARCHAR,
     NEEDS_REVIEW        BOOLEAN,
@@ -75,6 +76,11 @@ CREATE TABLE IF NOT EXISTS FOODBUY_MASALA_PROD.COMPLIANCE_LAB.COMPLIANCE_RULES_W
     CONSTRAINT PK_COMPLIANCE_RULES_WORKFLOW_ROWS PRIMARY KEY (ID)
 )
 COMMENT = 'ONE ENGINE normalized workbook rows and current decisions';
+
+-- Upgrade existing deployments created before Audit Action became part of the
+-- atomic Product Request outcome.
+ALTER TABLE FOODBUY_MASALA_PROD.COMPLIANCE_LAB.COMPLIANCE_RULES_WORKFLOW_ROWS
+    ADD COLUMN IF NOT EXISTS AUDIT_ACTION VARCHAR;
 
 -- --------------------------------------------------------------------------
 -- 3. Bundled and user-authored rule definitions
@@ -163,6 +169,79 @@ CREATE TABLE IF NOT EXISTS FOODBUY_MASALA_PROD.COMPLIANCE_LAB.COMPLIANCE_RULES_R
 COMMENT = 'ONE ENGINE runtime reference-list values';
 
 -- --------------------------------------------------------------------------
+-- 8. Immutable workflow catalog versions
+-- --------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS FOODBUY_MASALA_PROD.COMPLIANCE_LAB.COMPLIANCE_RULES_CATALOG_VERSIONS (
+    ID                  VARCHAR       NOT NULL,
+    WORKFLOW_ID         VARCHAR       NOT NULL,
+    VERSION_NUMBER      NUMBER(38, 0) NOT NULL,
+    STATUS              VARCHAR       NOT NULL,
+    DISTILLERY_RUN_ID   VARCHAR,
+    PARENT_VERSION_ID   VARCHAR,
+    CREATED_BY          VARCHAR,
+    CREATED_AT          TIMESTAMP_TZ  NOT NULL,
+    ACTIVATED_BY        VARCHAR,
+    ACTIVATED_AT        TIMESTAMP_TZ,
+    VERSION_JSON        VARIANT       NOT NULL,
+    CONSTRAINT PK_COMPLIANCE_RULES_CATALOG_VERSIONS PRIMARY KEY (ID),
+    CONSTRAINT UQ_COMPLIANCE_RULES_CATALOG_VERSION UNIQUE (WORKFLOW_ID, VERSION_NUMBER)
+)
+COMMENT = 'ONE ENGINE immutable workflow catalog version headers';
+
+-- --------------------------------------------------------------------------
+-- 9. Versioned rule definitions retained for activation and rollback
+-- --------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS FOODBUY_MASALA_PROD.COMPLIANCE_LAB.COMPLIANCE_RULES_CATALOG_VERSION_RULES (
+    ID                  VARCHAR      NOT NULL,
+    CATALOG_VERSION_ID  VARCHAR      NOT NULL,
+    WORKFLOW_ID         VARCHAR      NOT NULL,
+    RULE_ID             VARCHAR      NOT NULL,
+    RULE_JSON           VARIANT      NOT NULL,
+    CREATED_AT          TIMESTAMP_TZ NOT NULL,
+    CONSTRAINT PK_COMPLIANCE_RULES_CATALOG_VERSION_RULES PRIMARY KEY (ID),
+    CONSTRAINT UQ_COMPLIANCE_RULES_CATALOG_VERSION_RULE UNIQUE (CATALOG_VERSION_ID, RULE_ID)
+)
+COMMENT = 'ONE ENGINE immutable rules belonging to catalog versions';
+
+-- --------------------------------------------------------------------------
+-- 10. Persistent evidence rows not covered by governed literal filters
+-- --------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS FOODBUY_MASALA_PROD.COMPLIANCE_LAB.COMPLIANCE_RULES_DISTILLERY_GAPS (
+    ID                  VARCHAR      NOT NULL,
+    CATALOG_VERSION_ID  VARCHAR      NOT NULL,
+    WORKFLOW_ID         VARCHAR      NOT NULL,
+    SOURCE_GROUP        VARCHAR,
+    PAIR_ID             VARCHAR,
+    STATUS              VARCHAR      NOT NULL,
+    RESOLUTION          VARCHAR,
+    GAP_JSON            VARIANT      NOT NULL,
+    CREATED_AT          TIMESTAMP_TZ NOT NULL,
+    UPDATED_AT          TIMESTAMP_TZ NOT NULL,
+    CONSTRAINT PK_COMPLIANCE_RULES_DISTILLERY_GAPS PRIMARY KEY (ID)
+)
+COMMENT = 'ONE ENGINE unresolved Distillery gaps and their evidence';
+
+-- --------------------------------------------------------------------------
+-- 11. Workflow-aware canonical outcome aliases
+-- --------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS FOODBUY_MASALA_PROD.COMPLIANCE_LAB.COMPLIANCE_RULES_OUTCOME_ALIASES (
+    WORKFLOW_ID         VARCHAR      NOT NULL,
+    FIELD_NAME          VARCHAR      NOT NULL,
+    RAW_VALUE_KEY       VARCHAR      NOT NULL,
+    RAW_VALUE           VARCHAR,
+    CANONICAL_VALUE     VARCHAR,
+    STATUS              VARCHAR      NOT NULL,
+    UPDATED_BY          VARCHAR,
+    UPDATED_AT          TIMESTAMP_TZ NOT NULL,
+    CONSTRAINT UQ_COMPLIANCE_RULES_OUTCOME_ALIAS UNIQUE (
+        WORKFLOW_ID,
+        FIELD_NAME,
+        RAW_VALUE_KEY
+    )
+)
+COMMENT = 'ONE ENGINE reviewed raw-to-canonical outcome mappings';
+
+-- --------------------------------------------------------------------------
 -- Seed the default local-vendor reference list without duplicating values.
 -- --------------------------------------------------------------------------
 MERGE INTO FOODBUY_MASALA_PROD.COMPLIANCE_LAB.COMPLIANCE_RULES_REFERENCE_LISTS AS TARGET
@@ -201,7 +280,7 @@ WHEN NOT MATCHED THEN INSERT (
 );
 
 -- --------------------------------------------------------------------------
--- Verification: seven rows should be returned, all in COMPLIANCE_LAB.
+-- Verification: eleven rows should be returned, all in COMPLIANCE_LAB.
 -- --------------------------------------------------------------------------
 SELECT
     TABLE_CATALOG,
@@ -220,7 +299,11 @@ WHERE TABLE_SCHEMA = 'COMPLIANCE_LAB'
       'COMPLIANCE_RULES_RUNS',
       'COMPLIANCE_RULES_ROW_RESULTS',
       'COMPLIANCE_RULES_AUDIT_EVENTS',
-      'COMPLIANCE_RULES_REFERENCE_LISTS'
+      'COMPLIANCE_RULES_REFERENCE_LISTS',
+      'COMPLIANCE_RULES_CATALOG_VERSIONS',
+      'COMPLIANCE_RULES_CATALOG_VERSION_RULES',
+      'COMPLIANCE_RULES_DISTILLERY_GAPS',
+      'COMPLIANCE_RULES_OUTCOME_ALIASES'
   )
 ORDER BY TABLE_NAME;
 
@@ -245,6 +328,18 @@ FROM FOODBUY_MASALA_PROD.COMPLIANCE_LAB.COMPLIANCE_RULES_AUDIT_EVENTS
 UNION ALL
 SELECT 'COMPLIANCE_RULES_REFERENCE_LISTS', COUNT(*)
 FROM FOODBUY_MASALA_PROD.COMPLIANCE_LAB.COMPLIANCE_RULES_REFERENCE_LISTS
+UNION ALL
+SELECT 'COMPLIANCE_RULES_CATALOG_VERSIONS', COUNT(*)
+FROM FOODBUY_MASALA_PROD.COMPLIANCE_LAB.COMPLIANCE_RULES_CATALOG_VERSIONS
+UNION ALL
+SELECT 'COMPLIANCE_RULES_CATALOG_VERSION_RULES', COUNT(*)
+FROM FOODBUY_MASALA_PROD.COMPLIANCE_LAB.COMPLIANCE_RULES_CATALOG_VERSION_RULES
+UNION ALL
+SELECT 'COMPLIANCE_RULES_DISTILLERY_GAPS', COUNT(*)
+FROM FOODBUY_MASALA_PROD.COMPLIANCE_LAB.COMPLIANCE_RULES_DISTILLERY_GAPS
+UNION ALL
+SELECT 'COMPLIANCE_RULES_OUTCOME_ALIASES', COUNT(*)
+FROM FOODBUY_MASALA_PROD.COMPLIANCE_LAB.COMPLIANCE_RULES_OUTCOME_ALIASES
 ORDER BY TABLE_NAME;
 
 -- ============================================================================
