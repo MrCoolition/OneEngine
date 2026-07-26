@@ -13,12 +13,14 @@ import hashlib
 import io
 import json
 import math
+import os
 import platform
 import re
 import sys
 import traceback
 import uuid
 import zipfile
+from collections import Counter, defaultdict, deque
 from contextlib import contextmanager
 from importlib import metadata as importlib_metadata
 from time import perf_counter
@@ -26,7 +28,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal, InvalidOperation
-from typing import Any, Iterable, Iterator, Mapping, MutableMapping, Sequence
+from typing import Any, Callable, Iterable, Iterator, Mapping, MutableMapping, Sequence
 from xml.etree import ElementTree as ET
 from xml.sax.saxutils import escape as xml_escape
 
@@ -50,11 +52,11 @@ except Exception:  # Enables import-based engine tests outside Snowflake.
 
 
 APP_TITLE = "ONE ENGINE"
-APP_VERSION = "2026.07.26-one-engine-snowpark-v1"
+APP_VERSION = "2026.07.26-one-engine-single-file-distillery-v2"
 SESSION_STATE_SCHEMA_VERSION = 7
 WORKBOOK_PARSER_VERSION = "2026.07.24-v7-uncached"
 MAX_DIAGNOSTIC_EVENTS = 50
-DEPLOYMENT_SENTINEL = "ONE_ENGINE_SNOWFLAKE_LIVE_20260726"
+DEPLOYMENT_SENTINEL = "ONE_ENGINE_SINGLE_FILE_DISTILLERY_20260726"
 LIVE_BUILD_BADGE = "ONE ENGINE · SNOWFLAKE · LIVE"
 TARGET_ROLE = "FOODBUY_AXIOM_COMPLIANCE_PROD"
 TARGET_WAREHOUSE = "COMPLIANCE_PROD_WH"
@@ -2770,6 +2772,1916 @@ def parse_source_workbook(file_name: str, data: bytes) -> ParsedWorkbook:
     raise ValueError("Upload a CSV, XLSX, or XLSM source file.")
 
 
+# -----------------------------------------------------------------------------
+# Rules Distillery — single-file BEFORE/AFTER rule induction
+# -----------------------------------------------------------------------------
+
+
+DISTILLERY_VERSION = "2026.07.26-single-file-v1"
+DISTILLERY_SUPPORTED_EXTENSIONS = {
+    "csv",
+    "tsv",
+    "txt",
+    "xlsx",
+    "xlsm",
+    "json",
+    "jsonl",
+    "ndjson",
+    "parquet",
+    "feather",
+}
+DISTILLERY_STOP_WORDS = {
+    "and",
+    "are",
+    "for",
+    "from",
+    "into",
+    "not",
+    "the",
+    "this",
+    "with",
+    "without",
+    "item",
+    "product",
+    "case",
+    "each",
+    "pack",
+    "count",
+}
+
+PRODUCT_REQUEST_DISTILLERY_PROFILE: dict[str, Any] = {
+    "profile_id": "product_request",
+    "version": "1.1.0",
+    "description": "Product Request PRF/SORF/SRF daily decision sources",
+    "output_fields": [
+        {
+            "source": "ACTION",
+            "target": "action",
+            "action_type": "set_action",
+            "normalizer": "action",
+        },
+        {
+            "source": "If In Stock: Action",
+            "target": "if_in_stock_action",
+            "action_type": "set_if_stock",
+            "normalizer": "action",
+        },
+    ],
+    "column_aliases": {
+        "Case": "Case#",
+        "Case #": "Case#",
+        "Subcategory": "Sub Category",
+        "Buy Smart Action": "Buysmart Action",
+        "If In-Stock Action": "If In Stock: Action",
+        "If In Stock Action": "If In Stock: Action",
+    },
+    "matching": {
+        "identity_groups": [
+            ["Case#"],
+            ["Unit Number", "DIN", "MIN", "Vendor"],
+            ["Unit Number", "DIN", "Vendor", "Description"],
+            ["Business", "Type", "DIN", "MIN", "Description"],
+        ],
+        "ignored_fields": ["Buysmart Action"],
+        "volatile_fields": [
+            "Request Assignee",
+            "Case Owner",
+            "Status",
+            "Last Modified",
+        ],
+        "similarity_fields": [
+            "Business",
+            "Type",
+            "Case#",
+            "Sector",
+            "Division",
+            "Unit Number",
+            "Vendor",
+            "DIN",
+            "MIN",
+            "Manufacturer",
+            "Brand",
+            "Description",
+            "Parent Category",
+            "Sub Category",
+            "Usage",
+            "One-Time or Permanent",
+            "Reason for request",
+            "Meets Criteria",
+            "In CAT",
+            "On MOG",
+            "Pantry",
+            "K12 APL",
+            "Compass APL",
+            "Conversion DIN",
+            "Conversion VA%",
+        ],
+        "minimum_similarity": 0.72,
+        "ambiguity_margin": 0.05,
+    },
+    "induction": {
+        "feature_fields": [
+            "business",
+            "type",
+            "sector",
+            "division",
+            "vendor",
+            "manufacturer",
+            "brand",
+            "description",
+            "parent_category",
+            "sub_category",
+            "usage",
+            "one_time_or_permanent",
+            "reason_for_request",
+            "dpl",
+            "meets_criteria",
+            "in_cat",
+            "on_mog",
+            "pantry",
+            "k12_apl",
+            "compass_apl",
+            "conversion_din",
+            "conversion_manufacturer",
+            "conversion_brand",
+            "conversion_item_description",
+            "conversion_va",
+            "audit_action",
+            "supply_chain_description",
+            "pack",
+            "parent",
+            "dst",
+            "input_action",
+            "input_if_in_stock_action",
+            "input_buysmart_action",
+            "business_key",
+            "request_type_key",
+            "usage_num",
+            "meets_criteria_num",
+            "conversion_va_num",
+            "is_one_time",
+            "is_permanent",
+            "is_in_catalog",
+            "is_in_cat_y",
+            "is_temp_available",
+            "is_pantry",
+            "is_k12_apl",
+            "is_core_apl",
+            "is_s1",
+            "is_foh",
+            "is_diverse",
+            "has_conversion",
+            "is_levy",
+            "is_schools",
+        ],
+        "numeric_fields": [
+            "usage_num",
+            "meets_criteria_num",
+            "conversion_va_num",
+        ],
+        "token_fields": [
+            "vendor",
+            "manufacturer",
+            "brand",
+            "description",
+            "parent_category",
+            "sub_category",
+            "reason_for_request",
+            "on_mog",
+            "compass_apl",
+            "conversion_manufacturer",
+            "conversion_brand",
+            "conversion_item_description",
+            "audit_action",
+            "supply_chain_description",
+            "input_action",
+            "input_if_in_stock_action",
+        ],
+        "minimum_leaf_size": 1,
+        "maximum_depth": 16,
+        "minimum_gain": 1e-9,
+        "maximum_category_splits": 16,
+        "maximum_numeric_splits": 16,
+        "maximum_token_splits": 24,
+        "minimum_token_support": 5,
+        "minimum_general_support": 3,
+        "exception_identity_groups": [
+            ["case"],
+            ["unit_number", "din", "min", "vendor"],
+            ["business", "type", "din", "min", "description"],
+        ],
+    },
+    "feature_projector": "product_request",
+}
+
+DISTILLERY_PROFILES: dict[str, dict[str, Any]] = {
+    "product_request": PRODUCT_REQUEST_DISTILLERY_PROFILE,
+}
+
+
+@dataclass(frozen=True)
+class DistilleryAtom:
+    field: str
+    operator: str
+    value: Any = None
+
+
+@dataclass(frozen=True)
+class DistilleryPair:
+    pair_id: str
+    source_group: str
+    before_index: int
+    after_index: int
+    before: Mapping[str, Any]
+    after: Mapping[str, Any]
+    outputs: Mapping[str, Any]
+    method: str
+    score: float
+    ambiguous: bool = False
+    changed_input_fields: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class DistilleryProjected:
+    pair: DistilleryPair
+    features: Mapping[str, Any]
+    label: tuple[tuple[str, Any], ...]
+
+
+@dataclass(frozen=True)
+class DistilleryRule:
+    rule_id: str
+    priority: int
+    predicates: tuple[DistilleryAtom, ...]
+    outputs: Mapping[str, Any]
+    support: int
+    confidence: float
+    source_groups: tuple[str, ...]
+    kind: str
+    evidence_ids: tuple[str, ...]
+    validation_accuracy: float = 0.0
+
+
+@dataclass(frozen=True)
+class DistillerySplit:
+    atom: DistilleryAtom
+    gain: float
+    true_indices: tuple[int, ...]
+    false_indices: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class DistilleryLeaf:
+    path: tuple[DistilleryAtom, ...]
+    indices: tuple[int, ...]
+    predicted: tuple[tuple[str, Any], ...]
+    confidence: float
+
+
+def distillery_profile(profile_id: str) -> dict[str, Any]:
+    profile = DISTILLERY_PROFILES.get(clean_text(profile_id))
+    if profile is None:
+        raise ValueError(f"Unknown Distillery profile: {profile_id}")
+    return deepcopy(profile)
+
+
+def distillery_field(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", clean_text(value).lower()).strip("_")
+
+
+def distillery_number(value: Any) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float, Decimal)):
+        number = float(value)
+        return None if math.isnan(number) else number
+    text = clean_text(value).replace(",", "").strip()
+    if not text or text.lower() == "blank":
+        return None
+    is_percent = text.endswith("%")
+    if is_percent:
+        text = text[:-1].strip()
+    match = re.search(r"-?\d+(?:\.\d+)?", text)
+    if not match:
+        return None
+    number = float(match.group(0))
+    return number / 100.0 if is_percent else number
+
+
+def distillery_stable_value(value: Any) -> str:
+    if (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float, Decimal))
+        and (number := distillery_number(value)) is not None
+    ):
+        return f"n:{number:.12g}"
+    return f"s:{normalize_key(value)}"
+
+
+def distillery_action(value: Any) -> str:
+    text = clean_text(value)
+    aliases = {
+        "1 X": "1X",
+        "1X": "1X",
+        "APPROVED 1 X": "Approved - 1X",
+        "APPROVED 1X": "Approved - 1X",
+        "FIND ALT 1ST": "Find Alt First",
+        "FIND ALT FIRST": "Find Alt First",
+        "OK": "OK",
+        "BLANK": "",
+    }
+    return aliases.get(normalize_key(text), text)
+
+
+def distillery_evidence_hash(row: Mapping[str, Any]) -> str:
+    canonical: dict[str, Any] = {}
+    for key, value in row.items():
+        field = distillery_field(key)
+        if field and (field not in canonical or not clean_text(canonical[field])):
+            canonical[field] = value
+    payload = [
+        (key, distillery_stable_value(value))
+        for key, value in sorted(canonical.items())
+    ]
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+
+
+def distillery_canonicalize_row(
+    row: Mapping[str, Any],
+    profile: Mapping[str, Any],
+) -> dict[str, Any]:
+    aliases = {
+        clean_text(key).lower(): clean_text(value)
+        for key, value in (profile.get("column_aliases") or {}).items()
+    }
+    output: dict[str, Any] = {}
+    for raw_key, value in row.items():
+        key = clean_text(raw_key)
+        canonical = aliases.get(key.lower(), key)
+        if canonical and (
+            canonical not in output or not clean_text(output[canonical])
+        ):
+            output[canonical] = value
+    return output
+
+
+def distillery_records_from_bytes(
+    name: str,
+    data: bytes,
+) -> tuple[Mapping[str, Any], ...]:
+    extension = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+    if extension in {"csv", "tsv", "txt", "xlsx", "xlsm"}:
+        parsed = parse_source_workbook(name, data)
+        return tuple(dict(row) for row in parsed.rows)
+    if extension in {"json", "jsonl", "ndjson"}:
+        text = data.decode("utf-8-sig")
+        if extension in {"jsonl", "ndjson"}:
+            values = [
+                json.loads(line) for line in text.splitlines() if line.strip()
+            ]
+        else:
+            payload = json.loads(text)
+            if isinstance(payload, list):
+                values = payload
+            elif isinstance(payload, Mapping):
+                candidate = (
+                    payload.get("rows")
+                    or payload.get("records")
+                    or payload.get("data")
+                )
+                values = (
+                    candidate if isinstance(candidate, list) else [payload]
+                )
+            else:
+                raise ValueError(f"JSON source {name!r} must contain records.")
+        return tuple(dict(item) for item in values if isinstance(item, Mapping))
+    if extension in {"parquet", "feather"}:
+        if pd is None:
+            raise RuntimeError("Pandas is required for columnar sources.")
+        buffer = io.BytesIO(data)
+        frame = (
+            pd.read_parquet(buffer)
+            if extension == "parquet"
+            else pd.read_feather(buffer)
+        )
+        frame = frame.where(frame.notna(), None)
+        return tuple(frame.to_dict(orient="records"))
+    raise ValueError(f"No Distillery adapter is registered for {name!r}.")
+
+
+def distillery_source_group(name: str) -> str:
+    base = clean_text(name).replace("\\", "/").rsplit("/", 1)[-1]
+    return base.rsplit(".", 1)[0] if "." in base else base
+
+
+def distillery_documents_from_upload(
+    file_name: str,
+    data: bytes,
+    profile: Mapping[str, Any],
+) -> tuple[dict[str, Any], ...]:
+    members: list[tuple[str, bytes]] = []
+    extension = file_name.replace("\\", "/").rsplit("/", 1)[-1]
+    extension = extension.rsplit(".", 1)[-1].lower() if "." in extension else ""
+    if extension == "zip":
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            for member in sorted(archive.namelist()):
+                if member.endswith("/"):
+                    continue
+                extension = (
+                    member.rsplit(".", 1)[-1].lower() if "." in member else ""
+                )
+                if extension in DISTILLERY_SUPPORTED_EXTENSIONS:
+                    members.append((member, archive.read(member)))
+    else:
+        members.append((file_name, data))
+    documents: list[dict[str, Any]] = []
+    groups: set[str] = set()
+    for member, member_data in members:
+        extension = member.rsplit(".", 1)[-1].lower()
+        base_name = member.replace("\\", "/").rsplit("/", 1)[-1]
+        group = distillery_source_group(base_name)
+        if group in groups:
+            raise ValueError(
+                f"Duplicate source group {group!r} in {file_name!r}."
+            )
+        groups.add(group)
+        records = distillery_records_from_bytes(base_name, member_data)
+        rows = tuple(
+            distillery_canonicalize_row(row, profile) for row in records
+        )
+        documents.append(
+            {
+                "name": base_name,
+                "source_type": extension,
+                "source_group": group,
+                "rows": rows,
+                "row_count": len(rows),
+            }
+        )
+    if not documents:
+        raise ValueError(
+            f"{file_name!r} contains no supported Distillery source files."
+        )
+    return tuple(documents)
+
+
+def distillery_non_output_fields(
+    before: Mapping[str, Any],
+    after: Mapping[str, Any],
+    profile: Mapping[str, Any],
+) -> tuple[str, ...]:
+    output_fields = {
+        clean_text(item.get("source"))
+        for item in profile.get("output_fields") or []
+    }
+    matching = profile.get("matching") or {}
+    excluded = (
+        output_fields
+        | set(matching.get("ignored_fields") or [])
+        | set(matching.get("volatile_fields") or [])
+    )
+    return tuple(sorted((set(before) | set(after)) - excluded))
+
+
+def distillery_fingerprint(
+    row: Mapping[str, Any],
+    fields: Iterable[str],
+) -> str:
+    payload = [
+        (field, distillery_stable_value(row.get(field)))
+        for field in sorted(fields)
+    ]
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def distillery_identity_key(
+    row: Mapping[str, Any],
+    fields: Sequence[str],
+) -> tuple[str, ...] | None:
+    values = tuple(normalize_key(row.get(field)) for field in fields)
+    return values if values and all(values) else None
+
+
+def distillery_similarity(
+    before: Mapping[str, Any],
+    after: Mapping[str, Any],
+    fields: Sequence[str],
+) -> float:
+    comparable = 0
+    matched = 0.0
+    for field in fields:
+        left = normalize_key(before.get(field))
+        right = normalize_key(after.get(field))
+        if not left and not right:
+            continue
+        comparable += 1
+        if left == right:
+            matched += 1.0
+        elif left and right and (left in right or right in left):
+            matched += 0.6
+    return matched / comparable if comparable else 0.0
+
+
+def distillery_outputs(
+    after: Mapping[str, Any],
+    profile: Mapping[str, Any],
+) -> dict[str, Any]:
+    output: dict[str, Any] = {}
+    for contract in profile.get("output_fields") or []:
+        value = after.get(contract.get("source"))
+        output[clean_text(contract.get("target"))] = (
+            distillery_action(value)
+            if clean_text(contract.get("normalizer")) == "action"
+            else clean_text(value)
+        )
+    return output
+
+
+def distillery_make_pair(
+    before_document: Mapping[str, Any],
+    after_document: Mapping[str, Any],
+    before_index: int,
+    after_index: int,
+    profile: Mapping[str, Any],
+    method: str,
+    score: float,
+    ambiguous: bool = False,
+) -> DistilleryPair:
+    before = before_document["rows"][before_index]
+    after = after_document["rows"][after_index]
+    fields = distillery_non_output_fields(before, after, profile)
+    changed = tuple(
+        field
+        for field in fields
+        if distillery_stable_value(before.get(field))
+        != distillery_stable_value(after.get(field))
+    )
+    pair_payload = json.dumps(
+        dict(before),
+        default=str,
+        sort_keys=True,
+        ensure_ascii=False,
+    )
+    pair_id = hashlib.sha256(
+        (
+            f"{before_document['source_group']}|{before_index}|"
+            f"{after_index}|{pair_payload}"
+        ).encode("utf-8")
+    ).hexdigest()[:24]
+    return DistilleryPair(
+        pair_id=pair_id,
+        source_group=clean_text(before_document["source_group"]),
+        before_index=before_index,
+        after_index=after_index,
+        before=before,
+        after=after,
+        outputs=distillery_outputs(after, profile),
+        method=method,
+        score=score,
+        ambiguous=ambiguous,
+        changed_input_fields=changed,
+    )
+
+
+def distillery_match_document_pair(
+    before_document: Mapping[str, Any],
+    after_document: Mapping[str, Any],
+    profile: Mapping[str, Any],
+) -> tuple[list[DistilleryPair], list[dict[str, Any]]]:
+    before_rows = before_document["rows"]
+    after_rows = after_document["rows"]
+    unmatched_before = set(range(len(before_rows)))
+    unmatched_after = set(range(len(after_rows)))
+    pairs: list[DistilleryPair] = []
+    all_fields = sorted(
+        set().union(*(row.keys() for row in before_rows))
+        | set().union(*(row.keys() for row in after_rows))
+    )
+    output_fields = {
+        clean_text(item.get("source"))
+        for item in profile.get("output_fields") or []
+    }
+    matching = profile.get("matching") or {}
+    all_fields = [
+        field
+        for field in all_fields
+        if field
+        not in (
+            output_fields
+            | set(matching.get("ignored_fields") or [])
+            | set(matching.get("volatile_fields") or [])
+        )
+    ]
+    before_fingerprints: dict[str, deque[int]] = defaultdict(deque)
+    after_fingerprints: dict[str, deque[int]] = defaultdict(deque)
+    for index in unmatched_before:
+        before_fingerprints[
+            distillery_fingerprint(before_rows[index], all_fields)
+        ].append(index)
+    for index in unmatched_after:
+        after_fingerprints[
+            distillery_fingerprint(after_rows[index], all_fields)
+        ].append(index)
+    for fingerprint in sorted(
+        set(before_fingerprints) & set(after_fingerprints)
+    ):
+        left = before_fingerprints[fingerprint]
+        right = after_fingerprints[fingerprint]
+        while left and right:
+            before_index = left.popleft()
+            after_index = right.popleft()
+            unmatched_before.discard(before_index)
+            unmatched_after.discard(after_index)
+            pairs.append(
+                distillery_make_pair(
+                    before_document,
+                    after_document,
+                    before_index,
+                    after_index,
+                    profile,
+                    "exact_payload",
+                    1.0,
+                )
+            )
+    for identity_fields in matching.get("identity_groups") or []:
+        before_index: dict[tuple[str, ...], list[int]] = defaultdict(list)
+        after_index: dict[tuple[str, ...], list[int]] = defaultdict(list)
+        for index in unmatched_before:
+            key = distillery_identity_key(
+                before_rows[index], identity_fields
+            )
+            if key:
+                before_index[key].append(index)
+        for index in unmatched_after:
+            key = distillery_identity_key(after_rows[index], identity_fields)
+            if key:
+                after_index[key].append(index)
+        for key in sorted(set(before_index) & set(after_index)):
+            left = before_index[key]
+            right = after_index[key]
+            if len(left) != 1 or len(right) != 1:
+                continue
+            before_row_index = left[0]
+            after_row_index = right[0]
+            unmatched_before.discard(before_row_index)
+            unmatched_after.discard(after_row_index)
+            pairs.append(
+                distillery_make_pair(
+                    before_document,
+                    after_document,
+                    before_row_index,
+                    after_row_index,
+                    profile,
+                    "unique_identity",
+                    0.98,
+                )
+            )
+    similarity_fields = matching.get("similarity_fields") or all_fields
+    proposals: list[tuple[float, float, int, int]] = []
+    minimum_similarity = float(matching.get("minimum_similarity", 0.72))
+    ambiguity_margin = float(matching.get("ambiguity_margin", 0.05))
+    for before_index in unmatched_before:
+        scores = sorted(
+            (
+                (
+                    distillery_similarity(
+                        before_rows[before_index],
+                        after_rows[after_index],
+                        similarity_fields,
+                    ),
+                    after_index,
+                )
+                for after_index in unmatched_after
+            ),
+            reverse=True,
+        )
+        if not scores or scores[0][0] < minimum_similarity:
+            continue
+        margin = scores[0][0] - (scores[1][0] if len(scores) > 1 else 0.0)
+        for score, after_index in scores:
+            if score < minimum_similarity:
+                break
+            proposals.append((score, margin, before_index, after_index))
+    for score, margin, before_index, after_index in sorted(
+        proposals,
+        key=lambda item: (item[0], item[1]),
+        reverse=True,
+    ):
+        if (
+            before_index not in unmatched_before
+            or after_index not in unmatched_after
+        ):
+            continue
+        unmatched_before.remove(before_index)
+        unmatched_after.remove(after_index)
+        pairs.append(
+            distillery_make_pair(
+                before_document,
+                after_document,
+                before_index,
+                after_index,
+                profile,
+                "similarity",
+                score,
+                ambiguous=margin < ambiguity_margin,
+            )
+        )
+    unmatched = [
+        {
+            "side": "before",
+            "source_group": before_document["source_group"],
+            "row_index": index,
+        }
+        for index in sorted(unmatched_before)
+    ]
+    unmatched.extend(
+        {
+            "side": "after",
+            "source_group": after_document["source_group"],
+            "row_index": index,
+        }
+        for index in sorted(unmatched_after)
+    )
+    return sorted(pairs, key=lambda pair: pair.before_index), unmatched
+
+
+def distillery_match_documents(
+    before_documents: Sequence[Mapping[str, Any]],
+    after_documents: Sequence[Mapping[str, Any]],
+    profile: Mapping[str, Any],
+) -> tuple[tuple[DistilleryPair, ...], tuple[dict[str, Any], ...]]:
+    def index(
+        documents: Sequence[Mapping[str, Any]],
+        side: str,
+    ) -> dict[str, Mapping[str, Any]]:
+        output: dict[str, Mapping[str, Any]] = {}
+        for document in documents:
+            group = clean_text(document.get("source_group"))
+            if group in output:
+                raise ValueError(f"Duplicate {side} source group {group!r}.")
+            output[group] = document
+        return output
+
+    before_by_group = index(before_documents, "BEFORE")
+    after_by_group = index(after_documents, "AFTER")
+    missing_after = sorted(set(before_by_group) - set(after_by_group))
+    missing_before = sorted(set(after_by_group) - set(before_by_group))
+    if missing_after or missing_before:
+        raise ValueError(
+            f"Unpaired source groups: missing AFTER={missing_after}, "
+            f"missing BEFORE={missing_before}"
+        )
+    pairs: list[DistilleryPair] = []
+    unmatched: list[dict[str, Any]] = []
+    for group in sorted(before_by_group):
+        group_pairs, group_unmatched = distillery_match_document_pair(
+            before_by_group[group],
+            after_by_group[group],
+            profile,
+        )
+        pairs.extend(group_pairs)
+        unmatched.extend(group_unmatched)
+    return tuple(pairs), tuple(unmatched)
+
+
+def distillery_product_request_features(
+    row: Mapping[str, Any],
+) -> dict[str, Any]:
+    values = {distillery_field(key): value for key, value in row.items()}
+    values["input_action"] = values.get("action")
+    values["input_if_in_stock_action"] = values.get("if_in_stock_action")
+    values["input_buysmart_action"] = values.get("buysmart_action")
+    business = clean_text(values.get("business"))
+    request_type = clean_text(values.get("type"))
+    sector = clean_text(values.get("sector")).lower()
+    division = clean_text(values.get("division")).lower()
+    compass_apl = clean_text(values.get("compass_apl")).lower()
+    pantry = clean_text(values.get("pantry")).lower()
+    in_cat = clean_text(values.get("in_cat")).lower()
+    duration = clean_text(values.get("one_time_or_permanent"))
+    conversion_din = clean_text(values.get("conversion_din"))
+    values.update(
+        {
+            "business_key": normalize_key(business),
+            "request_type_key": normalize_key(request_type),
+            "usage_num": distillery_number(values.get("usage")),
+            "meets_criteria_num": distillery_number(
+                values.get("meets_criteria")
+            ),
+            "conversion_va_num": distillery_number(
+                values.get("conversion_va")
+            ),
+            "is_one_time": bool(
+                re.search(r"one-time|one time|seasonal", duration, re.I)
+            ),
+            "is_permanent": "permanent" in duration.lower(),
+            "is_in_cat_y": in_cat == "y",
+            "is_temp_available": "temp available" in in_cat or in_cat == "ta",
+            "is_in_catalog": in_cat == "y" or "temp available" in in_cat,
+            "is_pantry": "item" in pantry
+            or "subcategory" in pantry
+            or pantry == "y",
+            "is_k12_apl": clean_text(values.get("k12_apl")).lower() == "y",
+            "is_core_apl": "core apl" in compass_apl,
+            "is_s1": bool(re.search(r"\bs1\b", compass_apl, re.I)),
+            "is_foh": "front of house" in compass_apl
+            or bool(re.search(r"\bfoh\b", compass_apl, re.I)),
+            "is_diverse": "diverse" in compass_apl,
+            "has_conversion": bool(conversion_din),
+            "is_levy": "levy" in sector or "levy" in division,
+            "is_schools": "school" in division
+            or "chartwells" in division,
+        }
+    )
+    return values
+
+
+DISTILLERY_PROJECTORS: dict[
+    str,
+    Callable[[Mapping[str, Any]], Mapping[str, Any]],
+] = {
+    "product_request": distillery_product_request_features,
+}
+
+
+def distillery_project_pairs(
+    pairs: Sequence[DistilleryPair],
+    profile: Mapping[str, Any],
+) -> tuple[DistilleryProjected, ...]:
+    projector_name = clean_text(profile.get("feature_projector"))
+    projector = DISTILLERY_PROJECTORS.get(projector_name)
+    if projector is None:
+        projector = lambda row: {
+            distillery_field(key): value for key, value in row.items()
+        }
+    output: list[DistilleryProjected] = []
+    for pair in pairs:
+        features = dict(projector(pair.before))
+        features["__evidence_hash"] = distillery_evidence_hash(pair.before)
+        output.append(
+            DistilleryProjected(
+                pair=pair,
+                features=features,
+                label=tuple(sorted(pair.outputs.items())),
+            )
+        )
+    return tuple(output)
+
+
+def distillery_evaluate_atom(
+    atom: DistilleryAtom,
+    features: Mapping[str, Any],
+) -> bool:
+    left = features.get(atom.field)
+    right = atom.value
+    operator = atom.operator
+    if operator == "eq":
+        return normalize_key(left) == normalize_key(right)
+    if operator == "ne":
+        return normalize_key(left) != normalize_key(right)
+    if operator in {"in", "not_in"}:
+        options = (
+            right if isinstance(right, (list, tuple, set)) else [right]
+        )
+        matched = normalize_key(left) in {
+            normalize_key(item) for item in options
+        }
+        return matched if operator == "in" else not matched
+    if operator == "blank":
+        return not clean_text(left)
+    if operator == "not_blank":
+        return bool(clean_text(left))
+    if operator == "is_true":
+        return bool(left)
+    if operator == "is_false":
+        return not bool(left)
+    if operator == "contains":
+        return clean_text(right).lower() in clean_text(left).lower()
+    if operator == "not_contains":
+        return clean_text(right).lower() not in clean_text(left).lower()
+    left_number = distillery_number(left)
+    right_number = distillery_number(right)
+    if left_number is None or right_number is None:
+        return False
+    comparisons = {
+        "ge": left_number >= right_number,
+        "gt": left_number > right_number,
+        "lt": left_number < right_number,
+        "le": left_number <= right_number,
+    }
+    return comparisons.get(operator, False)
+
+
+def distillery_inverse_atom(atom: DistilleryAtom) -> DistilleryAtom:
+    inverse = {
+        "eq": "ne",
+        "ne": "eq",
+        "in": "not_in",
+        "not_in": "in",
+        "blank": "not_blank",
+        "not_blank": "blank",
+        "is_true": "is_false",
+        "is_false": "is_true",
+        "contains": "not_contains",
+        "not_contains": "contains",
+        "ge": "lt",
+        "lt": "ge",
+        "gt": "le",
+        "le": "gt",
+    }
+    return DistilleryAtom(atom.field, inverse[atom.operator], atom.value)
+
+
+def distillery_tokens(value: Any) -> set[str]:
+    tokens = {
+        token.lower()
+        for token in re.findall(
+            r"[A-Za-z0-9][A-Za-z0-9&'/-]{2,}",
+            clean_text(value),
+        )
+    }
+    return {
+        token for token in tokens if token not in DISTILLERY_STOP_WORDS
+    }
+
+
+def distillery_sample(values: Sequence[Any], maximum: int) -> list[Any]:
+    if len(values) <= maximum:
+        return list(values)
+    if maximum <= 1:
+        return [values[len(values) // 2]]
+    indexes = {
+        round(index * (len(values) - 1) / (maximum - 1))
+        for index in range(maximum)
+    }
+    return [values[index] for index in sorted(indexes)]
+
+
+class SingleFileRuleInducer:
+    def __init__(self, profile: Mapping[str, Any]):
+        self.profile = profile
+        self.config = profile.get("induction") or {}
+        self.rows: Sequence[DistilleryProjected] = ()
+        self.candidate_coverages: tuple[
+            tuple[DistilleryAtom, frozenset[int]], ...
+        ] = ()
+        self.identity_labels: dict[
+            tuple[str, ...],
+            dict[tuple[str, ...], frozenset[tuple[tuple[str, Any], ...]]],
+        ] = {}
+        self.normalized_values: dict[str, tuple[str, ...]] = {}
+        self.lower_values: dict[str, tuple[str, ...]] = {}
+        self.numeric_values: dict[str, tuple[float | None, ...]] = {}
+        self.token_values: dict[str, tuple[frozenset[str], ...]] = {}
+        self.candidate_matrix: Any = None
+        self.label_codes: Any = None
+        self.label_count = 0
+
+    def prepare_feature_caches(self) -> None:
+        fields = {
+            field
+            for field in self.config.get("feature_fields") or []
+            if field != "*"
+        }
+        fields.update(
+            distillery_field(field)
+            for group in self.config.get("exception_identity_groups") or []
+            for field in group
+        )
+        numeric_fields = set(self.config.get("numeric_fields") or [])
+        token_fields = set(self.config.get("token_fields") or [])
+        for field in fields:
+            values = tuple(row.features.get(field) for row in self.rows)
+            self.normalized_values[field] = tuple(
+                normalize_key(value) for value in values
+            )
+            self.lower_values[field] = tuple(
+                clean_text(value).lower() for value in values
+            )
+            if field in numeric_fields:
+                self.numeric_values[field] = tuple(
+                    distillery_number(value) for value in values
+                )
+            if field in token_fields:
+                self.token_values[field] = tuple(
+                    frozenset(distillery_tokens(value)) for value in values
+                )
+
+    def candidate_atoms(
+        self,
+        indices: Sequence[int],
+    ) -> Iterable[DistilleryAtom]:
+        numeric_fields = set(self.config.get("numeric_fields") or [])
+        token_fields = set(self.config.get("token_fields") or [])
+        for field in self.config.get("feature_fields") or []:
+            if field == "*":
+                continue
+            values = [self.rows[index].features.get(field) for index in indices]
+            normalized_values = self.normalized_values[field]
+            if field in numeric_fields:
+                numbers = sorted(
+                    {
+                        number
+                        for index in indices
+                        if (
+                            number := self.numeric_values[field][index]
+                        )
+                        is not None
+                    }
+                )
+                if len(numbers) > 1:
+                    thresholds = [
+                        (left + right) / 2.0
+                        for left, right in zip(numbers, numbers[1:])
+                    ]
+                    for threshold in distillery_sample(
+                        thresholds,
+                        int(self.config.get("maximum_numeric_splits", 16)),
+                    ):
+                        yield DistilleryAtom(field, "ge", threshold)
+                if any(
+                    value is None or not clean_text(value) for value in values
+                ):
+                    yield DistilleryAtom(field, "blank")
+                continue
+            non_blank_indices = [
+                index for index in indices if normalized_values[index]
+            ]
+            non_blank = [
+                self.rows[index].features.get(field)
+                for index in non_blank_indices
+            ]
+            if len(non_blank_indices) < len(indices) and non_blank:
+                yield DistilleryAtom(field, "blank")
+            if not non_blank:
+                continue
+            if all(isinstance(value, bool) for value in non_blank):
+                yield DistilleryAtom(field, "is_true")
+                continue
+            counts = Counter(
+                normalized_values[index] for index in non_blank_indices
+            )
+            display_values: dict[str, Any] = {}
+            for index in non_blank_indices:
+                display_values.setdefault(
+                    normalized_values[index],
+                    self.rows[index].features.get(field),
+                )
+            maximum_categories = int(
+                self.config.get("maximum_category_splits", 16)
+            )
+            for value, _ in counts.most_common(maximum_categories):
+                yield DistilleryAtom(field, "eq", display_values[value])
+            labels_by_value: dict[
+                str,
+                Counter[tuple[tuple[str, Any], ...]],
+            ] = defaultdict(Counter)
+            for index in indices:
+                if normalized_values[index]:
+                    labels_by_value[normalized_values[index]][
+                        self.rows[index].label
+                    ] += 1
+            grouped: dict[
+                tuple[tuple[str, Any], ...],
+                list[str],
+            ] = defaultdict(list)
+            for value, label_counts in labels_by_value.items():
+                grouped[label_counts.most_common(1)[0][0]].append(value)
+            for grouped_values in grouped.values():
+                if 1 < len(grouped_values) <= maximum_categories:
+                    ordered = sorted(
+                        grouped_values,
+                        key=lambda value: counts[value],
+                        reverse=True,
+                    )
+                    yield DistilleryAtom(
+                        field,
+                        "in",
+                        [display_values[value] for value in ordered],
+                    )
+            if field in token_fields:
+                token_counts: Counter[str] = Counter()
+                for index in indices:
+                    token_counts.update(self.token_values[field][index])
+                for token, count in token_counts.most_common(
+                    int(self.config.get("maximum_token_splits", 24))
+                ):
+                    if (
+                        count
+                        >= int(self.config.get("minimum_token_support", 5))
+                        and count < len(indices)
+                    ):
+                        yield DistilleryAtom(field, "contains", token)
+
+    def coverage_for_atom(self, atom: DistilleryAtom) -> frozenset[int]:
+        field = atom.field
+        operator = atom.operator
+        if operator in {
+            "eq",
+            "ne",
+            "in",
+            "not_in",
+            "blank",
+            "not_blank",
+        }:
+            values = self.normalized_values[field]
+            universe = set(range(len(values)))
+            if operator in {"eq", "ne"}:
+                target = normalize_key(atom.value)
+                matched = {
+                    index for index, value in enumerate(values) if value == target
+                }
+                return frozenset(
+                    matched if operator == "eq" else universe - matched
+                )
+            if operator in {"in", "not_in"}:
+                options = (
+                    atom.value
+                    if isinstance(atom.value, (list, tuple, set))
+                    else [atom.value]
+                )
+                targets = {normalize_key(value) for value in options}
+                matched = {
+                    index for index, value in enumerate(values) if value in targets
+                }
+                return frozenset(
+                    matched if operator == "in" else universe - matched
+                )
+            matched = {index for index, value in enumerate(values) if not value}
+            return frozenset(
+                matched if operator == "blank" else universe - matched
+            )
+        if operator in {"is_true", "is_false"}:
+            matched = {
+                index
+                for index, row in enumerate(self.rows)
+                if bool(row.features.get(field))
+            }
+            universe = set(range(len(self.rows)))
+            return frozenset(
+                matched if operator == "is_true" else universe - matched
+            )
+        if operator in {"contains", "not_contains"}:
+            target = clean_text(atom.value).lower()
+            matched = {
+                index
+                for index, value in enumerate(self.lower_values[field])
+                if target in value
+            }
+            universe = set(range(len(self.rows)))
+            return frozenset(
+                matched if operator == "contains" else universe - matched
+            )
+        target = distillery_number(atom.value)
+        if target is None:
+            return frozenset()
+        comparisons = {
+            "ge": lambda value: value >= target,
+            "gt": lambda value: value > target,
+            "lt": lambda value: value < target,
+            "le": lambda value: value <= target,
+        }
+        comparator = comparisons[operator]
+        return frozenset(
+            index
+            for index, value in enumerate(self.numeric_values[field])
+            if value is not None and comparator(value)
+        )
+
+    def prepare_indexes(self) -> None:
+        self.prepare_feature_caches()
+        all_indices = tuple(range(len(self.rows)))
+        candidates: list[tuple[DistilleryAtom, frozenset[int]]] = []
+        seen: set[tuple[str, str, str]] = set()
+        for atom in self.candidate_atoms(all_indices):
+            signature = (atom.field, atom.operator, repr(atom.value))
+            if signature in seen:
+                continue
+            seen.add(signature)
+            coverage = self.coverage_for_atom(atom)
+            if coverage and len(coverage) < len(self.rows):
+                candidates.append((atom, coverage))
+        self.candidate_coverages = tuple(candidates)
+        try:
+            import numpy as np
+        except Exception as exc:
+            raise RuntimeError(
+                "Rules Distillery requires numpy, which is included with pandas."
+            ) from exc
+        matrix = np.zeros(
+            (len(self.rows), len(self.candidate_coverages)),
+            dtype=np.bool_,
+        )
+        for column, (_, coverage) in enumerate(self.candidate_coverages):
+            if coverage:
+                matrix[
+                    np.fromiter(coverage, dtype=np.int64),
+                    column,
+                ] = True
+        labels = list(dict.fromkeys(row.label for row in self.rows))
+        label_code = {label: index for index, label in enumerate(labels)}
+        self.candidate_matrix = matrix
+        self.label_codes = np.fromiter(
+            (label_code[row.label] for row in self.rows),
+            dtype=np.int32,
+        )
+        self.label_count = len(labels)
+        identity_labels: dict[
+            tuple[str, ...],
+            dict[tuple[str, ...], set[tuple[tuple[str, Any], ...]]],
+        ] = {}
+        for group in self.config.get("exception_identity_groups") or []:
+            canonical_group = tuple(distillery_field(field) for field in group)
+            index: dict[
+                tuple[str, ...],
+                set[tuple[tuple[str, Any], ...]],
+            ] = defaultdict(set)
+            for row in self.rows:
+                key = tuple(
+                    normalize_key(row.features.get(field))
+                    for field in canonical_group
+                )
+                if key and all(key):
+                    index[key].add(row.label)
+            identity_labels[canonical_group] = index
+        self.identity_labels = {
+            group: {
+                key: frozenset(labels) for key, labels in values.items()
+            }
+            for group, values in identity_labels.items()
+        }
+
+    def best_split(
+        self,
+        indices: Sequence[int],
+    ) -> DistillerySplit | None:
+        import numpy as np
+
+        node_indices = np.asarray(indices, dtype=np.int64)
+        node_labels = self.label_codes[node_indices]
+        parent_counts = np.bincount(
+            node_labels,
+            minlength=self.label_count,
+        ).astype(np.float64)
+        probabilities = parent_counts[parent_counts > 0] / len(node_indices)
+        parent_entropy = float(
+            -(probabilities * np.log2(probabilities)).sum()
+        )
+        if parent_entropy <= 0.0 or self.candidate_matrix.shape[1] == 0:
+            return None
+        matrix = self.candidate_matrix[node_indices]
+        true_totals = matrix.sum(axis=0, dtype=np.int64)
+        false_totals = len(node_indices) - true_totals
+        minimum_leaf = int(self.config.get("minimum_leaf_size", 1))
+        valid = (true_totals >= minimum_leaf) & (
+            false_totals >= minimum_leaf
+        )
+        if not bool(valid.any()):
+            return None
+        true_counts = np.zeros(
+            (self.label_count, matrix.shape[1]),
+            dtype=np.float64,
+        )
+        for label_code in range(self.label_count):
+            label_mask = node_labels == label_code
+            if bool(label_mask.any()):
+                true_counts[label_code] = matrix[label_mask].sum(
+                    axis=0,
+                    dtype=np.int64,
+                )
+        false_counts = parent_counts[:, None] - true_counts
+
+        def entropy_columns(counts: Any, totals: Any) -> Any:
+            with np.errstate(divide="ignore", invalid="ignore"):
+                values = np.divide(
+                    counts,
+                    totals[None, :],
+                    out=np.zeros_like(counts),
+                    where=totals[None, :] > 0,
+                )
+                terms = np.where(
+                    values > 0,
+                    values * np.log2(values),
+                    0.0,
+                )
+            return -terms.sum(axis=0)
+
+        child_entropy = (
+            true_totals
+            / len(node_indices)
+            * entropy_columns(true_counts, true_totals)
+            + false_totals
+            / len(node_indices)
+            * entropy_columns(false_counts, false_totals)
+        )
+        gains = parent_entropy - child_entropy
+        gains[~valid] = -np.inf
+        balance = np.minimum(true_totals, false_totals)
+        scores = gains + balance / max(len(node_indices), 1) * 1e-12
+        best_column = int(np.argmax(scores))
+        gain = float(gains[best_column])
+        if (
+            not math.isfinite(gain)
+            or gain < float(self.config.get("minimum_gain", 1e-9))
+        ):
+            return None
+        true_mask = matrix[:, best_column]
+        return DistillerySplit(
+            atom=self.candidate_coverages[best_column][0],
+            gain=gain,
+            true_indices=tuple(
+                int(value) for value in node_indices[true_mask]
+            ),
+            false_indices=tuple(
+                int(value) for value in node_indices[~true_mask]
+            ),
+        )
+
+    def build_leaves(
+        self,
+        indices: tuple[int, ...],
+        path: tuple[DistilleryAtom, ...],
+        depth: int,
+    ) -> list[DistilleryLeaf]:
+        counts = Counter(self.rows[index].label for index in indices)
+        predicted, count = counts.most_common(1)[0]
+        confidence = count / len(indices)
+        if (
+            confidence == 1.0
+            or depth >= int(self.config.get("maximum_depth", 16))
+        ):
+            return [DistilleryLeaf(path, indices, predicted, confidence)]
+        split = self.best_split(indices)
+        if split is None:
+            return [DistilleryLeaf(path, indices, predicted, confidence)]
+        return [
+            *self.build_leaves(
+                split.true_indices,
+                (*path, split.atom),
+                depth + 1,
+            ),
+            *self.build_leaves(
+                split.false_indices,
+                (*path, distillery_inverse_atom(split.atom)),
+                depth + 1,
+            ),
+        ]
+
+    @staticmethod
+    def rule_id(
+        prefix: str,
+        path: Sequence[DistilleryAtom],
+        label: tuple[tuple[str, Any], ...],
+    ) -> str:
+        payload = repr((tuple(path), label)).encode("utf-8")
+        return (
+            f"{prefix}-"
+            f"{hashlib.sha256(payload).hexdigest()[:12].upper()}"
+        )
+
+    def general_rules(
+        self,
+        leaves: Sequence[DistilleryLeaf],
+    ) -> list[DistilleryRule]:
+        rules: list[DistilleryRule] = []
+        ordered = sorted(
+            leaves,
+            key=lambda leaf: (
+                -len(leaf.path),
+                -leaf.confidence,
+                -len(leaf.indices),
+            ),
+        )
+        minimum_support = int(
+            self.config.get("minimum_general_support", 3)
+        )
+        profile_id = clean_text(self.profile.get("profile_id")).upper()
+        for index, leaf in enumerate(ordered):
+            if (
+                leaf.confidence < 1.0
+                or len(leaf.indices) < minimum_support
+            ):
+                continue
+            rules.append(
+                DistilleryRule(
+                    rule_id=self.rule_id(
+                        f"DISTILLED-{profile_id}-GENERAL",
+                        leaf.path,
+                        leaf.predicted,
+                    ),
+                    priority=100_000 + index,
+                    predicates=leaf.path,
+                    outputs=dict(leaf.predicted),
+                    support=len(leaf.indices),
+                    confidence=1.0,
+                    source_groups=tuple(
+                        sorted(
+                            {
+                                self.rows[row_index].pair.source_group
+                                for row_index in leaf.indices
+                            }
+                        )
+                    ),
+                    kind="general",
+                    evidence_ids=tuple(
+                        self.rows[row_index].pair.pair_id
+                        for row_index in leaf.indices
+                    ),
+                )
+            )
+        return rules
+
+    @staticmethod
+    def predict(
+        features: Mapping[str, Any],
+        rules: Sequence[DistilleryRule],
+    ) -> Mapping[str, Any] | None:
+        for rule in sorted(rules, key=lambda item: item.priority):
+            if all(
+                distillery_evaluate_atom(atom, features)
+                for atom in rule.predicates
+            ):
+                return rule.outputs
+        return None
+
+    def exception_rules(
+        self,
+        general_rules: Sequence[DistilleryRule],
+    ) -> list[DistilleryRule]:
+        residuals = [
+            index
+            for index, row in enumerate(self.rows)
+            if self.predict(row.features, general_rules) != dict(row.label)
+        ]
+        grouped: dict[
+            tuple[str, tuple[tuple[str, Any], ...]],
+            dict[str, Any],
+        ] = {}
+        for index in residuals:
+            row = self.rows[index]
+            selector_field = "__evidence_hash"
+            selector_value = row.features[selector_field]
+            for identity_group, labels_by_key in self.identity_labels.items():
+                if len(identity_group) != 1:
+                    continue
+                field = identity_group[0]
+                value = row.features.get(field)
+                if not clean_text(value):
+                    continue
+                key = (normalize_key(value),)
+                if labels_by_key.get(key) == frozenset({row.label}):
+                    selector_field = field
+                    selector_value = value
+                    break
+            bucket = grouped.setdefault(
+                (selector_field, row.label),
+                {"values": [], "indices": []},
+            )
+            bucket["values"].append(selector_value)
+            bucket["indices"].append(index)
+        rules: list[DistilleryRule] = []
+        profile_id = clean_text(self.profile.get("profile_id")).upper()
+        for rule_index, ((field, label), bucket) in enumerate(
+            grouped.items()
+        ):
+            values = list(dict.fromkeys(bucket["values"]))
+            indices = list(bucket["indices"])
+            predicate = DistilleryAtom(
+                field,
+                "eq" if len(values) == 1 else "in",
+                values[0] if len(values) == 1 else values,
+            )
+            rules.append(
+                DistilleryRule(
+                    rule_id=self.rule_id(
+                        f"DISTILLED-{profile_id}-EXCEPTION",
+                        (predicate,),
+                        label,
+                    ),
+                    priority=10_000 + rule_index,
+                    predicates=(predicate,),
+                    outputs=dict(label),
+                    support=len(indices),
+                    confidence=1.0,
+                    source_groups=tuple(
+                        sorted(
+                            {
+                                self.rows[index].pair.source_group
+                                for index in indices
+                            }
+                        )
+                    ),
+                    kind="exception",
+                    evidence_ids=tuple(
+                        self.rows[index].pair.pair_id for index in indices
+                    ),
+                )
+            )
+        return rules
+
+    def fit(
+        self,
+        rows: Sequence[DistilleryProjected],
+        *,
+        include_exceptions: bool = True,
+    ) -> tuple[DistilleryRule, ...]:
+        if not rows:
+            return ()
+        self.rows = rows
+        self.prepare_indexes()
+        leaves = self.build_leaves(tuple(range(len(rows))), (), 0)
+        general = self.general_rules(leaves)
+        exceptions = self.exception_rules(general) if include_exceptions else []
+        return tuple(
+            sorted([*exceptions, *general], key=lambda rule: rule.priority)
+        )
+
+
+def distillery_validate(
+    rows: Sequence[DistilleryProjected],
+    rules: Sequence[DistilleryRule],
+) -> dict[str, Any]:
+    exact = 0
+    matched = 0
+    uncovered: list[str] = []
+    mismatched: list[str] = []
+    by_group: dict[str, Counter[str]] = defaultdict(Counter)
+    state_outputs: dict[
+        tuple[tuple[str, str], ...],
+        set[tuple[tuple[str, Any], ...]],
+    ] = defaultdict(set)
+    for row in rows:
+        state = tuple(
+            sorted((key, repr(value)) for key, value in row.features.items())
+        )
+        state_outputs[state].add(row.label)
+        predicted = SingleFileRuleInducer.predict(row.features, rules)
+        stats = by_group[row.pair.source_group]
+        stats["rows"] += 1
+        if predicted is None:
+            uncovered.append(row.pair.pair_id)
+            stats["uncovered"] += 1
+            continue
+        matched += 1
+        stats["matched"] += 1
+        if predicted == dict(row.label):
+            exact += 1
+            stats["exact"] += 1
+        else:
+            mismatched.append(row.pair.pair_id)
+            stats["mismatched"] += 1
+    row_count = len(rows)
+    return {
+        "row_count": row_count,
+        "matched_count": matched,
+        "exact_count": exact,
+        "accuracy": exact / row_count if row_count else 0.0,
+        "contradictions": sum(
+            len(outputs) > 1 for outputs in state_outputs.values()
+        ),
+        "uncovered_pair_ids": uncovered,
+        "mismatched_pair_ids": mismatched,
+        "by_source_group": {
+            group: {
+                **dict(stats),
+                "accuracy": (
+                    stats["exact"] / stats["rows"] if stats["rows"] else 0.0
+                ),
+            }
+            for group, stats in sorted(by_group.items())
+        },
+    }
+
+
+def distillery_holdouts(
+    rows: Sequence[DistilleryProjected],
+    profile: Mapping[str, Any],
+) -> dict[str, Any]:
+    groups = sorted({row.pair.source_group for row in rows})
+    folds: dict[str, Any] = {}
+    for holdout in groups:
+        training = [
+            row for row in rows if row.pair.source_group != holdout
+        ]
+        testing = [row for row in rows if row.pair.source_group == holdout]
+        rules = SingleFileRuleInducer(profile).fit(
+            training,
+            include_exceptions=False,
+        )
+        validation = distillery_validate(testing, rules)
+        folds[holdout] = {
+            "training_rows": len(training),
+            "testing_rows": len(testing),
+            "rule_count": len(rules),
+            "accuracy": validation["accuracy"],
+            "exact": validation["exact_count"],
+            "uncovered": len(validation["uncovered_pair_ids"]),
+            "mismatched": len(validation["mismatched_pair_ids"]),
+        }
+    accuracies = [fold["accuracy"] for fold in folds.values()]
+    return {
+        "strategy": "leave-one-source-group-out",
+        "folds": folds,
+        "mean_accuracy": (
+            sum(accuracies) / len(accuracies) if accuracies else 0.0
+        ),
+        "minimum_accuracy": min(accuracies) if accuracies else 0.0,
+        "maximum_accuracy": max(accuracies) if accuracies else 0.0,
+    }
+
+
+def distillery_predicate_json(
+    predicates: Sequence[DistilleryAtom],
+    profile_id: str,
+) -> dict[str, Any]:
+    values: list[dict[str, Any]] = [
+        {
+            "field": "__ruleset_id",
+            "op": "eq",
+            "value": profile_id,
+        }
+    ]
+    for atom in predicates:
+        predicate: dict[str, Any] = {
+            "field": atom.field,
+            "op": atom.operator,
+        }
+        if atom.operator not in {
+            "blank",
+            "not_blank",
+            "is_true",
+            "is_false",
+        }:
+            predicate["value"] = atom.value
+        values.append(predicate)
+    return {"all": values}
+
+
+def distillery_catalog(
+    rules: Sequence[DistilleryRule],
+    profile: Mapping[str, Any],
+    run_id: str,
+    holdout_accuracy: float,
+    deployment_eligible: bool,
+) -> list[dict[str, Any]]:
+    profile_id = clean_text(profile.get("profile_id"))
+    output_contract = {
+        clean_text(item.get("target")): item
+        for item in profile.get("output_fields") or []
+    }
+    catalog: list[dict[str, Any]] = []
+    for rule in sorted(rules, key=lambda item: item.priority):
+        evidence_digest = hashlib.sha256(
+            "|".join(sorted(rule.evidence_ids)).encode("utf-8")
+        ).hexdigest()
+        rule_uuid = str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"one-engine:{profile_id}:{rule.rule_id}",
+            )
+        )
+        variant_uuid = str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"one-engine:{profile_id}:{rule.rule_id}:variant",
+            )
+        )
+        status = "approved" if deployment_eligible else "draft"
+        automation = "alpha" if rule.kind == "general" else "evidence"
+        source = {
+            "kind": "rules_distillery",
+            "ruleset_id": profile_id,
+            "ruleset_version": clean_text(profile.get("version")),
+            "distillation_run_id": run_id,
+            "distillery_version": DISTILLERY_VERSION,
+            "distilled_rule_kind": rule.kind,
+            "support": rule.support,
+            "confidence": rule.confidence,
+            "holdout_accuracy": (
+                holdout_accuracy if rule.kind == "general" else 0.0
+            ),
+            "source_groups": list(rule.source_groups),
+            "evidence_count": len(rule.evidence_ids),
+            "evidence_sha256": evidence_digest,
+        }
+        actions = [
+            {
+                "type": clean_text(output_contract[target].get("action_type")),
+                "value": value,
+            }
+            for target, value in rule.outputs.items()
+            if target in output_contract
+        ]
+        catalog.append(
+            {
+                "id": rule_uuid,
+                "rule_id": rule.rule_id,
+                "name": (
+                    f"{profile_id.replace('_', ' ').title()} "
+                    f"{rule.kind.title()} Decision"
+                ),
+                "rule_group": f"Rules Distillery · {profile_id}",
+                "business_scope": "Profile-defined",
+                "request_types": [],
+                "discovery_reference": (
+                    "Mechanized BEFORE/AFTER distillation in ONE ENGINE"
+                ),
+                "notes": (
+                    "Generated inside Streamlit. General rules are pure, "
+                    "supported filters; evidence rules close deterministic "
+                    "historical residuals."
+                ),
+                "owner_team": "ONE ENGINE",
+                "status": status,
+                "automation_level": automation,
+                "is_bundled": False,
+                "ruleset_id": profile_id,
+                "distillation_run_id": run_id,
+                "updated_at": iso_now(),
+                "variants": [
+                    {
+                        "id": variant_uuid,
+                        "rule_id": rule.rule_id,
+                        "runtime_rule_id": f"{rule.rule_id}.01",
+                        "runtime_kind": "row_rule",
+                        "execution_priority": rule.priority,
+                        "enabled": deployment_eligible,
+                        "is_executable": True,
+                        "stop_processing": True,
+                        "predicate_json": distillery_predicate_json(
+                            rule.predicates,
+                            profile_id,
+                        ),
+                        "action_json": actions,
+                        "description": (
+                            f"Distilled {rule.kind} rule with support "
+                            f"{rule.support:,} and confidence "
+                            f"{rule.confidence:.3f}"
+                        ),
+                        "automation_level": automation,
+                        "status": status,
+                        "source": source,
+                    }
+                ],
+                "source": source,
+            }
+        )
+    return catalog
+
+
+def run_rules_distillery(
+    *,
+    profile_id: str,
+    before_file_name: str,
+    before_bytes: bytes,
+    after_file_name: str,
+    after_bytes: bytes,
+    run_holdouts: bool = True,
+) -> dict[str, Any]:
+    profile = distillery_profile(profile_id)
+    before_documents = distillery_documents_from_upload(
+        before_file_name,
+        before_bytes,
+        profile,
+    )
+    after_documents = distillery_documents_from_upload(
+        after_file_name,
+        after_bytes,
+        profile,
+    )
+    pairs, unmatched = distillery_match_documents(
+        before_documents,
+        after_documents,
+        profile,
+    )
+    projected = distillery_project_pairs(pairs, profile)
+    rules = SingleFileRuleInducer(profile).fit(
+        projected,
+        include_exceptions=True,
+    )
+    validation = distillery_validate(projected, rules)
+    holdout = (
+        distillery_holdouts(projected, profile)
+        if run_holdouts
+        else {
+            "strategy": "not-run",
+            "folds": {},
+            "mean_accuracy": 0.0,
+            "minimum_accuracy": 0.0,
+            "maximum_accuracy": 0.0,
+        }
+    )
+    deployment_eligible = (
+        validation["accuracy"] == 1.0
+        and validation["contradictions"] == 0
+        and not unmatched
+    )
+    before_hash = hashlib.sha256(before_bytes).hexdigest()
+    after_hash = hashlib.sha256(after_bytes).hexdigest()
+    run_id = hashlib.sha256(
+        "|".join(
+            [
+                DISTILLERY_VERSION,
+                profile_id,
+                clean_text(profile.get("version")),
+                before_hash,
+                after_hash,
+                "holdouts" if run_holdouts else "draft",
+            ]
+        ).encode("utf-8")
+    ).hexdigest()[:20]
+    methods = Counter(pair.method for pair in pairs)
+    changed_fields = Counter(
+        field for pair in pairs for field in pair.changed_input_fields
+    )
+    labels = Counter(
+        json.dumps(dict(row.label), sort_keys=True, ensure_ascii=False)
+        for row in projected
+    )
+    report = {
+        "run_id": run_id,
+        "profile_id": profile_id,
+        "profile_version": clean_text(profile.get("version")),
+        "distillery_version": DISTILLERY_VERSION,
+        "created_at": iso_now(),
+        "source": {
+            "before": {
+                "file_name": before_file_name,
+                "sha256": before_hash,
+                "documents": len(before_documents),
+                "rows": sum(
+                    int(document["row_count"])
+                    for document in before_documents
+                ),
+            },
+            "after": {
+                "file_name": after_file_name,
+                "sha256": after_hash,
+                "documents": len(after_documents),
+                "rows": sum(
+                    int(document["row_count"])
+                    for document in after_documents
+                ),
+            },
+        },
+        "matching": {
+            "pairs": len(pairs),
+            "unmatched": len(unmatched),
+            "ambiguous": sum(pair.ambiguous for pair in pairs),
+            "methods": dict(methods),
+            "changed_input_fields": dict(changed_fields.most_common()),
+        },
+        "labels": {
+            "unique": len(labels),
+            "counts": dict(labels.most_common()),
+        },
+        "rules": {
+            "total": len(rules),
+            "general": sum(rule.kind == "general" for rule in rules),
+            "exception": sum(rule.kind == "exception" for rule in rules),
+            "general_support": sum(
+                rule.support for rule in rules if rule.kind == "general"
+            ),
+            "exception_support": sum(
+                rule.support for rule in rules if rule.kind == "exception"
+            ),
+        },
+        "validation": validation,
+        "holdout": holdout,
+        "deployment_gate": {
+            "eligible": deployment_eligible,
+            "requirements": {
+                "corpus_accuracy": 1.0,
+                "unmatched_rows": 0,
+                "contradictions": 0,
+            },
+            "observed": {
+                "corpus_accuracy": validation["accuracy"],
+                "unmatched_rows": len(unmatched),
+                "contradictions": validation["contradictions"],
+            },
+        },
+    }
+    catalog = distillery_catalog(
+        rules,
+        profile,
+        run_id,
+        float(holdout.get("mean_accuracy") or 0.0),
+        deployment_eligible,
+    )
+    return {
+        "run_id": run_id,
+        "profile_id": profile_id,
+        "catalog": catalog,
+        "report": report,
+        "deployment_eligible": deployment_eligible,
+    }
+
+
 
 def _package_version(distribution_name: str) -> str:
     try:
@@ -3465,6 +5377,9 @@ def run_application_self_check() -> dict[str, Any]:
             "parse_source_workbook_for_ui",
             "parsed_workbook_to_payload",
             "run_result_to_payload",
+            "run_rules_distillery",
+            "promote_distilled_catalog",
+            "oneengine_brand.png",
             "render_actionable_exception",
         ]
         missing = [marker for marker in required_markers if marker not in source_text]
@@ -3474,6 +5389,8 @@ def run_application_self_check() -> dict[str, Any]:
             "isinstance(" + "parsed, " + "ParsedWorkbook)",
             "st.session_state[" + quote + "_last_execution_result" + quote + "] = " + "result",
             "st.session_state[" + quote + "_workbench_run_result" + quote + "] = " + "result",
+            "from " + "one_engine",
+            "import " + "one_engine",
         ]
         present_forbidden = [marker for marker in forbidden if marker in source_text]
         ddl_matches = re.findall(r"(?i)\bCREATE\s+(?:TABLE|DATABASE|SCHEMA)\b", source_text)
@@ -3809,6 +5726,71 @@ class SnowflakeRulesStore:
                 )
             """
             self.execute(query, [payload])
+
+    def promote_distilled_catalog(
+        self,
+        catalog: Sequence[Mapping[str, Any]],
+        report: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Atomically promote one Distillery run into the Snowflake catalog."""
+        if not catalog:
+            raise ValueError("The distilled catalog is empty.")
+        deployment_gate = report.get("deployment_gate") or {}
+        if not bool_value(deployment_gate.get("eligible")):
+            raise ValueError(
+                "The Distillery deployment gate did not pass. "
+                "Resolve unmatched rows, contradictions, or parity failures."
+            )
+        profile_id = clean_text(report.get("profile_id"))
+        run_id = clean_text(report.get("run_id"))
+        if not profile_id or not run_id:
+            raise ValueError("Distillery profile and run identifiers are required.")
+        current_ids = {
+            clean_text(rule.get("rule_id")).upper()
+            for rule in catalog
+            if clean_text(rule.get("rule_id"))
+        }
+        existing = self.load_rules()
+        retired: list[dict[str, Any]] = []
+        for existing_rule in existing:
+            source = existing_rule.get("source") or {}
+            if (
+                clean_text(source.get("kind")) != "rules_distillery"
+                or clean_text(source.get("ruleset_id")) != profile_id
+                or clean_text(existing_rule.get("rule_id")).upper() in current_ids
+            ):
+                continue
+            retired_rule = deepcopy(existing_rule)
+            retired_rule["status"] = "retired"
+            retired_rule["updated_at"] = iso_now()
+            for variant in retired_rule.get("variants") or []:
+                if isinstance(variant, MutableMapping):
+                    variant["enabled"] = False
+                    variant["status"] = "retired"
+            retired.append(retired_rule)
+        with self.transaction():
+            if retired:
+                self.upsert_rules(retired)
+            self.upsert_rules(catalog)
+            self.log_event(
+                entity_type="rules_distillery",
+                entity_id=run_id,
+                action="promote_distilled_catalog",
+                after={
+                    "run_id": run_id,
+                    "profile_id": profile_id,
+                    "rule_count": len(catalog),
+                    "retired_rule_count": len(retired),
+                    "deployment_eligible": True,
+                },
+                details=report,
+            )
+        return {
+            "run_id": run_id,
+            "profile_id": profile_id,
+            "promoted_rule_count": len(catalog),
+            "retired_rule_count": len(retired),
+        }
 
     def load_rules(self) -> list[dict[str, Any]]:
         query = f"""
@@ -4775,6 +6757,7 @@ PAGE_NAMES = [
     "Execution",
     "Analyst Workbench",
     "Reports",
+    "Rules Distillery",
     "Rules Catalog",
     "Simulator",
     "Settings",
@@ -6558,6 +8541,226 @@ def render_rule_builder(store: SnowflakeRulesStore, rules: Sequence[Mapping[str,
         )
 
 
+def render_rules_distillery_page(store: SnowflakeRulesStore) -> None:
+    render_page_header(
+        "Rules Distillery",
+        (
+            "Reverse engineer reusable rules from paired BEFORE and AFTER "
+            "evidence, validate them, and promote the approved catalog "
+            "directly into Snowflake."
+        ),
+        kicker="Mechanized Rule Discovery",
+    )
+    st.info(
+        "Generated catalogs are held only in this browser session until "
+        "promotion. Promotion writes rule JSON to the Snowflake rules table "
+        "and records the validation report in the audit table."
+    )
+    controls = st.columns([2, 1])
+    profile_id = controls[0].selectbox(
+        "Ruleset profile",
+        list(DISTILLERY_PROFILES),
+        format_func=lambda value: clean_text(
+            DISTILLERY_PROFILES[value].get("description")
+        ),
+        key="distillery_profile",
+    )
+    run_holdouts = controls[1].checkbox(
+        "Leave-one-source-group-out validation",
+        value=True,
+        key="distillery_holdouts",
+        help=(
+            "Recommended for promotion. This measures reusable rules against "
+            "each unseen source group without using evidence exceptions."
+        ),
+    )
+    source_columns = st.columns(2)
+    with source_columns[0]:
+        before_upload = st.file_uploader(
+            "BEFORE evidence",
+            type=["zip", *sorted(DISTILLERY_SUPPORTED_EXTENSIONS)],
+            key="distillery_before",
+            help=(
+                "Upload one source file or a ZIP containing accumulated "
+                "BEFORE sources. ZIP member basenames define pairing groups."
+            ),
+        )
+    with source_columns[1]:
+        after_upload = st.file_uploader(
+            "AFTER evidence",
+            type=["zip", *sorted(DISTILLERY_SUPPORTED_EXTENSIONS)],
+            key="distillery_after",
+            help=(
+                "Upload the corresponding AFTER file or ZIP. Source-group "
+                "basenames must match the BEFORE collection."
+            ),
+        )
+    run_disabled = before_upload is None or after_upload is None
+    if st.button(
+        "Distill and validate rules",
+        type="primary",
+        disabled=run_disabled,
+        key="distillery_run",
+    ):
+        try:
+            with st.spinner(
+                "Aligning evidence, inducing pure filters, closing residuals, "
+                "and validating the catalog…"
+            ):
+                result = run_rules_distillery(
+                    profile_id=profile_id,
+                    before_file_name=clean_text(before_upload.name),
+                    before_bytes=before_upload.getvalue(),
+                    after_file_name=clean_text(after_upload.name),
+                    after_bytes=after_upload.getvalue(),
+                    run_holdouts=run_holdouts,
+                )
+            st.session_state["_distillery_result"] = result
+            report = result["report"]
+            set_flash(
+                (
+                    f"Distillery run {result['run_id']} completed: "
+                    f"{report['validation']['exact_count']:,}/"
+                    f"{report['validation']['row_count']:,} exact rows and "
+                    f"{report['rules']['total']:,} generated rules."
+                ),
+                "success"
+                if result.get("deployment_eligible")
+                else "warning",
+            )
+            safe_rerun()
+        except Exception as exc:
+            render_actionable_exception(
+                "Rules Distillery could not complete this evidence run.",
+                exc,
+                component="Rules Distillery",
+                context={
+                    "profile_id": profile_id,
+                    "before_file": clean_text(
+                        getattr(before_upload, "name", "")
+                    ),
+                    "after_file": clean_text(
+                        getattr(after_upload, "name", "")
+                    ),
+                    "run_holdouts": run_holdouts,
+                },
+            )
+    result = st.session_state.get("_distillery_result")
+    if not isinstance(result, Mapping):
+        st.caption(
+            "Upload paired evidence and run the Distillery to create an "
+            "in-memory candidate catalog."
+        )
+        return
+    report = result.get("report") or {}
+    if clean_text(report.get("profile_id")) != profile_id:
+        st.warning(
+            "The displayed result belongs to a different profile. Run the "
+            "selected profile to replace it."
+        )
+    matching = report.get("matching") or {}
+    rules = report.get("rules") or {}
+    validation = report.get("validation") or {}
+    holdout = report.get("holdout") or {}
+    gate = report.get("deployment_gate") or {}
+    metrics = st.columns(6)
+    metrics[0].metric("Aligned pairs", f"{int(matching.get('pairs') or 0):,}")
+    metrics[1].metric("Unmatched", f"{int(matching.get('unmatched') or 0):,}")
+    metrics[2].metric("General rules", f"{int(rules.get('general') or 0):,}")
+    metrics[3].metric("Evidence rules", f"{int(rules.get('exception') or 0):,}")
+    metrics[4].metric(
+        "Corpus parity",
+        f"{float(validation.get('accuracy') or 0.0):.2%}",
+    )
+    metrics[5].metric(
+        "Holdout accuracy",
+        (
+            f"{float(holdout.get('mean_accuracy') or 0.0):.2%}"
+            if clean_text(holdout.get("strategy")) != "not-run"
+            else "Not run"
+        ),
+    )
+    if bool_value(gate.get("eligible")):
+        st.success(
+            "Deployment gate passed: exact corpus parity, zero unmatched rows, "
+            "and zero contradictory identical states."
+        )
+    else:
+        st.error(
+            "Deployment gate failed. The candidate catalog is disabled and "
+            "cannot be promoted."
+        )
+    folds = holdout.get("folds") or {}
+    if isinstance(folds, Mapping) and folds:
+        with st.expander("Temporal/source-group validation", expanded=False):
+            dataframe(
+                pd.DataFrame(
+                    [
+                        {
+                            "Source group": group,
+                            "Testing rows": int(values.get("testing_rows") or 0),
+                            "Rules": int(values.get("rule_count") or 0),
+                            "Accuracy": float(values.get("accuracy") or 0.0),
+                            "Exact": int(values.get("exact") or 0),
+                            "Uncovered": int(values.get("uncovered") or 0),
+                            "Mismatched": int(values.get("mismatched") or 0),
+                        }
+                        for group, values in folds.items()
+                    ]
+                )
+            )
+    with st.expander("Distillery run report", expanded=False):
+        st.json(report)
+        st.download_button(
+            "Download validation report",
+            data=json_dumps(report, pretty=True),
+            file_name=(
+                f"one_engine_distillery_{clean_text(result.get('run_id'))}.json"
+            ),
+            mime="application/json",
+            key="distillery_report_download",
+        )
+    st.markdown("#### Promote to Snowflake")
+    confirmation = st.checkbox(
+        (
+            "I confirm this validated catalog should replace the active "
+            f"{profile_id} Distillery catalog."
+        ),
+        key="distillery_promote_confirm",
+    )
+    if st.button(
+        "Promote catalog to COMPLIANCE_RULES_RULES",
+        disabled=not (
+            confirmation and bool_value(result.get("deployment_eligible"))
+        ),
+        key="distillery_promote",
+    ):
+        try:
+            promotion = store.promote_distilled_catalog(
+                result.get("catalog") or [],
+                report,
+            )
+            set_flash(
+                (
+                    f"Promoted {promotion['promoted_rule_count']:,} "
+                    f"{profile_id} rules to Snowflake and retired "
+                    f"{promotion['retired_rule_count']:,} obsolete rules."
+                )
+            )
+            safe_rerun()
+        except Exception as exc:
+            render_actionable_exception(
+                "The validated catalog could not be promoted to Snowflake.",
+                exc,
+                component="Rules Distillery promotion",
+                context={
+                    "run_id": clean_text(result.get("run_id")),
+                    "profile_id": profile_id,
+                    "rule_count": len(result.get("catalog") or []),
+                },
+            )
+
+
 def render_rules_catalog_page(store: SnowflakeRulesStore) -> None:
     render_page_header(
         "Rules Catalog",
@@ -7103,10 +9306,42 @@ def render_settings_page(store: SnowflakeRulesStore) -> None:
 # -----------------------------------------------------------------------------
 
 
+def one_engine_brand_image_path() -> str:
+    """Find an optional image uploaded beside the Snowflake Streamlit file."""
+    file_path = clean_text(globals().get("__file__"))
+    directory = os.path.dirname(file_path) if file_path else "."
+    preferred = (
+        "oneengine_brand.png",
+        "one_engine_brand.png",
+        "oneengine.png",
+        "one_engine.png",
+    )
+    for name in preferred:
+        candidate = os.path.join(directory, name)
+        if os.path.isfile(candidate):
+            return candidate
+    try:
+        for name in sorted(os.listdir(directory)):
+            lowered = name.lower()
+            if (
+                "oneengine" in lowered.replace("_", "").replace("-", "")
+                and lowered.endswith((".png", ".jpg", ".jpeg", ".webp"))
+            ):
+                candidate = os.path.join(directory, name)
+                if os.path.isfile(candidate):
+                    return candidate
+    except Exception:
+        pass
+    return ""
+
+
 def render_live_build_proof() -> None:
     """Render an unmistakable identity before Snowflake initialization."""
     require_streamlit()
     identity = source_code_fingerprint()
+    brand_image = one_engine_brand_image_path()
+    if brand_image:
+        st.sidebar.image(brand_image, use_container_width=True)
     st.sidebar.markdown(f"### {APP_TITLE}")
     st.sidebar.success(LIVE_BUILD_BADGE)
     st.sidebar.caption(APP_VERSION)
@@ -7203,6 +9438,8 @@ def main() -> None:
             render_workbench_page(store, selected_batch)
         elif page == "Reports":
             render_reports_page(store, selected_batch)
+        elif page == "Rules Distillery":
+            render_rules_distillery_page(store)
         elif page == "Rules Catalog":
             render_rules_catalog_page(store)
         elif page == "Simulator":

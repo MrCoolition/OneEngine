@@ -1,21 +1,16 @@
 from __future__ import annotations
 
 import importlib.util
-import json
 import sys
 import unittest
+import zipfile
 from pathlib import Path
-
-from one_engine.distillery.adapters import documents_from_path
-from one_engine.distillery.emitter import build_catalog, build_snowflake_merge_sql
-from one_engine.distillery.features import evidence_hash
-from one_engine.distillery.normalization import canonical_action
-from one_engine.distillery.pipeline import distill
-from one_engine.distillery.profiles import load_profile
 
 
 ROOT = Path(__file__).resolve().parents[1]
 APP_PATH = ROOT / "app" / "streamlit_app.py"
+BEFORE_PATH = ROOT / "before.zip"
+AFTER_PATH = ROOT / "after.zip"
 
 
 def load_app():
@@ -34,66 +29,118 @@ def load_app():
 class ProductRequestDistilleryTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.profile = load_profile("product_request")
-        cls.distilled_run = distill(
-            profile=cls.profile,
-            before_path=ROOT / "before.zip",
-            after_path=ROOT / "after.zip",
+        cls.app = load_app()
+        cls.profile = cls.app.distillery_profile("product_request")
+        cls.before_bytes = BEFORE_PATH.read_bytes()
+        cls.after_bytes = AFTER_PATH.read_bytes()
+        cls.before_documents = cls.app.distillery_documents_from_upload(
+            BEFORE_PATH.name,
+            cls.before_bytes,
+            cls.profile,
+        )
+        cls.after_documents = cls.app.distillery_documents_from_upload(
+            AFTER_PATH.name,
+            cls.after_bytes,
+            cls.profile,
+        )
+        cls.pairs, cls.unmatched = cls.app.distillery_match_documents(
+            cls.before_documents,
+            cls.after_documents,
+            cls.profile,
+        )
+        cls.result = cls.app.run_rules_distillery(
+            profile_id="product_request",
+            before_file_name=BEFORE_PATH.name,
+            before_bytes=cls.before_bytes,
+            after_file_name=AFTER_PATH.name,
+            after_bytes=cls.after_bytes,
             run_holdouts=False,
         )
-        cls.catalog = build_catalog(
-            cls.distilled_run.rules,
-            cls.profile,
-            run_id=cls.distilled_run.run_id,
-            holdout_accuracy=0.0,
-        )
-        cls.app = load_app()
+        cls.catalog = cls.result["catalog"]
 
     def test_corpus_alignment_is_complete(self) -> None:
-        self.assertEqual(6922, len(self.distilled_run.match_result.pairs))
-        self.assertEqual(0, len(self.distilled_run.match_result.unmatched))
-        self.assertEqual(1.0, self.distilled_run.validation.accuracy)
-        self.assertEqual(0, self.distilled_run.validation.contradictions)
+        report = self.result["report"]
+        self.assertEqual(6920, len(self.pairs))
+        self.assertEqual((), self.unmatched)
+        self.assertEqual(6920, report["matching"]["pairs"])
+        self.assertEqual(0, report["matching"]["unmatched"])
+        self.assertEqual(1.0, report["validation"]["accuracy"])
+        self.assertEqual(0, report["validation"]["contradictions"])
+        self.assertTrue(self.result["deployment_eligible"])
 
-    def test_catalog_is_compact_and_executable(self) -> None:
-        self.assertLessEqual(len(self.catalog), 200)
-        self.assertTrue(self.catalog)
+    def test_blank_spreadsheet_rows_are_not_evidence(self) -> None:
+        self.assertEqual(
+            6920,
+            sum(document["row_count"] for document in self.before_documents),
+        )
+        self.assertEqual(
+            6920,
+            sum(document["row_count"] for document in self.after_documents),
+        )
+        self.assertTrue(
+            all(
+                any(self.app.clean_text(value) for value in pair.before.values())
+                for pair in self.pairs
+            )
+        )
+
+    def test_single_xlsx_is_not_mistaken_for_a_zip_collection(self) -> None:
+        with zipfile.ZipFile(BEFORE_PATH) as archive:
+            member = next(
+                name
+                for name in archive.namelist()
+                if name.endswith("06_12_2026.xlsx")
+            )
+            documents = self.app.distillery_documents_from_upload(
+                "PRF_SORF_SRF_06_12_2026.xlsx",
+                archive.read(member),
+                self.profile,
+            )
+        self.assertEqual(1, len(documents))
+        self.assertEqual(662, documents[0]["row_count"])
+
+    def test_catalog_is_compact_scoped_and_executable(self) -> None:
+        self.assertEqual(169, len(self.catalog))
         for rule in self.catalog:
             variant = rule["variants"][0]
             self.assertTrue(variant["enabled"])
             self.assertTrue(variant["is_executable"])
             self.assertTrue(variant["stop_processing"])
             self.assertTrue(variant["action_json"])
+            predicates = variant["predicate_json"]["all"]
+            self.assertEqual("__ruleset_id", predicates[0]["field"])
+            self.assertEqual("product_request", predicates[0]["value"])
             source = rule["source"]
+            self.assertEqual("rules_distillery", source["kind"])
             if source["distilled_rule_kind"] == "general":
                 self.assertEqual(1.0, source["confidence"])
                 self.assertGreaterEqual(source["support"], 3)
 
-    def test_streamlit_runtime_executes_distilled_catalog_at_full_parity(self) -> None:
+    def test_streamlit_runtime_executes_catalog_at_full_parity(self) -> None:
         rows = [
             self.app.create_workflow_row(
                 "distillery-contract",
                 pair.before,
                 index + 2,
             )
-            for index, pair in enumerate(self.distilled_run.match_result.pairs)
+            for index, pair in enumerate(self.pairs)
         ]
         first_context = self.app.context_for_row(rows[0])
         self.assertEqual(
-            evidence_hash(self.distilled_run.match_result.pairs[0].before),
+            self.app.distillery_evidence_hash(self.pairs[0].before),
             first_context["__evidence_hash"],
         )
 
         executed, _, _ = self.app.execute_rows(rows, self.catalog)
-        mismatches: list[tuple[str, dict[str, str], dict[str, str]]] = []
-        for pair, row in zip(self.distilled_run.match_result.pairs, executed):
+        mismatches = []
+        for pair, row in zip(self.pairs, executed):
             expected = {
-                key: canonical_action(value)
+                key: self.app.distillery_action(value)
                 for key, value in pair.outputs.items()
             }
             actual = {
-                "action": canonical_action(row.get("action")),
-                "if_in_stock_action": canonical_action(
+                "action": self.app.distillery_action(row.get("action")),
+                "if_in_stock_action": self.app.distillery_action(
                     row.get("if_in_stock_action")
                 ),
             }
@@ -101,23 +148,19 @@ class ProductRequestDistilleryTests(unittest.TestCase):
                 mismatches.append((pair.pair_id, expected, actual))
         self.assertEqual([], mismatches[:10])
 
-    def test_source_loader_accepts_archives(self) -> None:
-        documents = documents_from_path(ROOT / "before.zip", self.profile)
-        self.assertEqual(10, len(documents))
-        self.assertEqual(6922, sum(len(document.rows) for document in documents))
-
-    def test_snowflake_loader_is_scoped_and_round_trips_catalog(self) -> None:
-        sql = build_snowflake_merge_sql(self.catalog)
-        sections = sql.split("\n$$\n")
-        self.assertEqual(3, len(sections))
-        embedded_catalog = json.loads(sections[1])
-        self.assertEqual(len(self.catalog), len(embedded_catalog))
-        self.assertIn("STATUS = 'retired'", sections[0])
-        self.assertNotIn("$ONE_ENGINE_CATALOG$", sql)
-        for rule in embedded_catalog:
-            predicates = rule["variants"][0]["predicate_json"]["all"]
-            self.assertEqual("__ruleset_id", predicates[0]["field"])
-            self.assertEqual("product_request", predicates[0]["value"])
+    def test_snowflake_is_the_catalog_system_of_record(self) -> None:
+        source = APP_PATH.read_text(encoding="utf-8")
+        self.assertNotIn("from " + "one_engine", source)
+        self.assertNotIn("import " + "one_engine", source)
+        self.assertEqual([], list((ROOT / "one_engine").rglob("*.py")))
+        self.assertEqual([], list((ROOT / "catalogs").rglob("*.*")))
+        self.assertTrue(hasattr(self.app, "SingleFileRuleInducer"))
+        self.assertTrue(
+            hasattr(
+                self.app.SnowflakeRulesStore,
+                "promote_distilled_catalog",
+            )
+        )
 
 
 if __name__ == "__main__":
