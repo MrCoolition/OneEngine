@@ -22,7 +22,7 @@ from difflib import SequenceMatcher
 from importlib import metadata as importlib_metadata
 from time import perf_counter
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dataclass_field
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Callable, Iterable, Iterator, Mapping, MutableMapping, Sequence
@@ -49,12 +49,12 @@ except Exception:  # Enables import-based engine tests outside Snowflake.
 
 
 APP_TITLE = "ONE ENGINE"
-APP_VERSION = "2026.07.26-one-engine-literal-distillery-v6"
-SESSION_STATE_SCHEMA_VERSION = 7
+APP_VERSION = "2026.07.27-one-engine-policy-distillery-v7"
+SESSION_STATE_SCHEMA_VERSION = 8
 WORKBOOK_PARSER_VERSION = "2026.07.24-v7-uncached"
 MAX_DIAGNOSTIC_EVENTS = 50
 DEPLOYMENT_SENTINEL = (
-    "ONE_ENGINE_FOODBUY_DESIGN_SYSTEM_LITERAL_FILTER_DISTILLERY_20260726"
+    "ONE_ENGINE_FOODBUY_DESIGN_SYSTEM_ELITE_POLICY_GROUNDED_DISTILLERY_20260727"
 )
 LIVE_BUILD_BADGE = "ONE ENGINE · SNOWFLAKE · LIVE"
 FOODBUY_DESIGN_SYSTEM_REFERENCE = (
@@ -905,6 +905,9 @@ def create_normalized_row(raw_row: Mapping[str, Any]) -> dict[str, Any]:
         "has_conversion": bool(clean_text(fields["conversionDin"])),
         "upstream_action_key": action_key,
         "current_action_key": action_key,
+        "current_action_class": semantic_action_class(
+            fields["upstreamAction"]
+        ),
         "current_buysmart_key": buysmart_key,
         "brand_lc": lower("brand"),
         "manufacturer_lc": lower("manufacturer"),
@@ -914,6 +917,19 @@ def create_normalized_row(raw_row: Mapping[str, Any]) -> dict[str, Any]:
         "division_lc": division,
         "sector_lc": lower("sector"),
         "reason_lc": lower("reasonForRequest"),
+        "is_reason_sponsorship": "sponsorship" in lower("reasonForRequest"),
+        "is_reason_menucycle": "menucycle" in lower("reasonForRequest"),
+        "is_reason_commodity": "commodity" in lower("reasonForRequest"),
+        "is_reason_allocation": "allocation" in lower("reasonForRequest"),
+        "is_documented_category_exception": bool(
+            re.search(
+                r"halal|gluten free|sugar free|vegan|kosher|"
+                r"\bgf\b|puree|nutritional",
+                fields["description"],
+                re.I,
+            )
+        ),
+        "din_is_new": "new" in lower("din"),
         "vendor_lc": lower("vendor"),
         "din_lc": lower("din"),
         "min_lc": lower("min"),
@@ -1010,6 +1026,9 @@ def refresh_derived(row: MutableMapping[str, Any]) -> MutableMapping[str, Any]:
     source["Buysmart Action"] = row.get("buysmart_action", "")
     normalized = create_normalized_row(source)
     normalized["derived"]["current_action_key"] = normalize_key(row.get("action"))
+    normalized["derived"]["current_action_class"] = semantic_action_class(
+        row.get("action")
+    )
     normalized["derived"]["current_buysmart_key"] = normalize_key(row.get("buysmart_action"))
     row["normalized_row"] = normalized
     if not clean_text(row.get("queue_bucket")):
@@ -1217,6 +1236,89 @@ def evaluate_predicate(
     return False
 
 
+def runtime_reference_features(
+    context: Mapping[str, Any],
+    reference_lists: Mapping[str, Sequence[str]] | None,
+) -> dict[str, Any]:
+    typed = (
+        (reference_lists or {}).get("__typed_datasets__")  # type: ignore[union-attr]
+        if isinstance(reference_lists, Mapping)
+        else None
+    )
+    if not isinstance(typed, Mapping):
+        return {}
+    identity_fields = (
+        "din",
+        "min",
+        "manufacturer",
+        "brand",
+        "vendor",
+        "description",
+    )
+    output: dict[str, Any] = {}
+    for contract, raw_records in typed.items():
+        matched: Mapping[str, Any] | None = None
+        for raw_record in raw_records or []:
+            if not isinstance(raw_record, Mapping):
+                continue
+            record = {
+                distillery_field(key): value
+                for key, value in raw_record.items()
+            }
+            if any(
+                normalize_key(context.get(field_name))
+                and normalize_key(context.get(field_name))
+                == normalize_key(record.get(field_name))
+                for field_name in identity_fields
+            ):
+                matched = record
+                break
+        reference_field = f"ref_{distillery_field(contract)}"
+        output[reference_field] = matched is not None
+        if matched is None:
+            continue
+        if contract == "conversion_mappings":
+            conversion_din = first_text(
+                matched.get("conversion_din"),
+                matched.get("converted_din"),
+                matched.get("target_din"),
+                matched.get("din"),
+            )
+            conversion_va = first_text(
+                matched.get("conversion_va"),
+                matched.get("conversion_va_pct"),
+                matched.get("va"),
+                matched.get("va_pct"),
+            )
+            if conversion_din:
+                output["conversion_din"] = conversion_din
+                output["has_conversion"] = True
+            if conversion_va:
+                output["conversion_va_num"] = distillery_number(
+                    conversion_va
+                )
+        elif contract == "k12_apl":
+            output["is_k12_apl"] = True
+        elif contract == "pantry":
+            output["is_pantry"] = True
+        elif contract == "compass_apl":
+            text = " ".join(
+                clean_text(value) for value in matched.values()
+            ).lower()
+            output.update(
+                {
+                    "is_core_apl": "core apl" in text,
+                    "is_s1": bool(re.search(r"\bs1\b", text, re.I)),
+                    "is_foh": (
+                        "front of house" in text
+                        or bool(re.search(r"\bfoh\b", text, re.I))
+                    ),
+                    "is_diverse": "diverse" in text,
+                }
+            )
+    return output
+
+
 def summarize_actions(actions: Sequence[Mapping[str, Any]]) -> str:
     parts: list[str] = []
     for action in actions:
@@ -1236,21 +1338,41 @@ def apply_actions(
 ) -> None:
     for node in actions:
         context = context_for_row(row)
+        context.update(
+            runtime_reference_features(context, reference_lists)
+        )
         when = node.get("when")
         if isinstance(when, Mapping) and not evaluate_predicate(when, context, reference_lists):
             continue
         if bool_value(node.get("only_if_action_blank")) and clean_text(row.get("action")):
             continue
         action_type = clean_text(node.get("type"))
+        effect = clean_text(node.get("effect")).lower() or "set"
+        resolved_value: Any = node.get("value")
+        if effect == "preserve":
+            resolved_value = context.get(
+                clean_text(node.get("input_field"))
+            )
+        elif effect == "clear":
+            resolved_value = ""
+        elif clean_text(node.get("value_template")):
+            template = clean_text(node.get("value_template"))
+            resolved_value = re.sub(
+                r"\{([a-zA-Z0-9_]+)\}",
+                lambda match: clean_text(
+                    context.get(match.group(1), "")
+                ),
+                template,
+            )
         if action_type == "set_action":
-            row["action"] = normalize_action(node.get("value"))
+            row["action"] = normalize_action(resolved_value)
         elif action_type == "set_action_by_duration":
             duration = clean_text(row.get("one_time_or_permanent")).lower()
             row["action"] = "1X" if "one" in duration or "seasonal" in duration else "OK"
         elif action_type == "set_if_stock":
-            row["if_in_stock_action"] = normalize_action(node.get("value"))
+            row["if_in_stock_action"] = normalize_action(resolved_value)
         elif action_type == "set_audit_action":
-            row["audit_action"] = clean_text(node.get("value"))
+            row["audit_action"] = clean_text(resolved_value)
         elif action_type == "set_buysmart":
             row["buysmart_action"] = normalize_action(node.get("value"))
         elif action_type == "set_review":
@@ -1321,6 +1443,9 @@ def execute_row(
         return row
 
     runtime_context = context_for_row(row)
+    runtime_context.update(
+        runtime_reference_features(runtime_context, reference_lists)
+    )
     for variant in ordered:
         predicate = variant.get("predicate_json")
         if not isinstance(predicate, Mapping) or not evaluate_predicate(
@@ -1349,6 +1474,12 @@ def execute_row(
         if bool_value(variant.get("stop_processing")):
             break
         runtime_context = context_for_row(row)
+        runtime_context.update(
+            runtime_reference_features(
+                runtime_context,
+                reference_lists,
+            )
+        )
 
     if not clean_text(row.get("buysmart_action")) and not bool_value(row.get("excluded")):
         row["buysmart_action"] = "Review" if bool_value(row.get("needs_review")) else "Assigned"
@@ -2902,7 +3033,7 @@ def parse_source_workbook(file_name: str, data: bytes) -> ParsedWorkbook:
 # -----------------------------------------------------------------------------
 
 
-DISTILLERY_VERSION = "2026.07.26-literal-filter-v2"
+DISTILLERY_VERSION = "2026.07.27-policy-grounded-v3"
 DISTILLERY_SUPPORTED_EXTENSIONS = {
     "csv",
     "tsv",
@@ -2936,7 +3067,7 @@ DISTILLERY_STOP_WORDS = {
 
 PRODUCT_REQUEST_DISTILLERY_PROFILE: dict[str, Any] = {
     "profile_id": "product_request",
-    "version": "2.0.0",
+    "version": "3.0.0",
     "description": "Product Request PRF/SORF/SRF daily decision sources",
     "output_fields": [
         {
@@ -3072,25 +3203,12 @@ PRODUCT_REQUEST_DISTILLERY_PROFILE: dict[str, Any] = {
             "conversion_va_num",
         ],
         "date_fields": [
-            "date_created",
+            # Source dates are lineage only. They are intentionally excluded
+            # from policy candidate generation.
         ],
         "token_fields": [
-            "vendor",
-            "manufacturer",
-            "brand",
-            "description",
-            "parent_category",
-            "sub_category",
-            "reason_for_request",
-            "on_mog",
-            "compass_apl",
-            "conversion_manufacturer",
-            "conversion_brand",
-            "conversion_item_description",
-            "audit_action",
-            "supply_chain_description",
-            "input_action",
-            "input_if_in_stock_action",
+            # Free-text token mining is prohibited for Product Request. Named
+            # semantic flags and governed reference datasets replace it.
         ],
         "minimum_leaf_size": 1,
         "maximum_depth": 16,
@@ -3111,39 +3229,6 @@ PRODUCT_REQUEST_DISTILLERY_PROFILE: dict[str, Any] = {
         "maximum_atoms_per_outcome": 32,
         "maximum_filters_per_outcome": 16,
         "governed_fields": [
-            "business",
-            "type",
-            "sector",
-            "division",
-            "vendor",
-            "manufacturer",
-            "brand",
-            "description",
-            "parent_category",
-            "sub_category",
-            "usage",
-            "one_time_or_permanent",
-            "reason_for_request",
-            "dpl",
-            "meets_criteria",
-            "in_cat",
-            "on_mog",
-            "pantry",
-            "k12_apl",
-            "compass_apl",
-            "conversion_din",
-            "conversion_manufacturer",
-            "conversion_brand",
-            "conversion_item_description",
-            "conversion_va",
-            "supply_chain_description",
-            "pack",
-            "parent",
-            "dst",
-            "input_action",
-            "input_if_in_stock_action",
-            "input_audit_action",
-            "date_created",
             "business_key",
             "request_type_key",
             "usage_num",
@@ -3163,6 +3248,17 @@ PRODUCT_REQUEST_DISTILLERY_PROFILE: dict[str, Any] = {
             "has_conversion",
             "is_levy",
             "is_schools",
+            "upstream_action_class",
+            "upstream_stock_action_class",
+            "upstream_audit_action_class",
+            "current_action_class",
+            "current_buysmart_key",
+            "is_reason_sponsorship",
+            "is_reason_menucycle",
+            "is_reason_commodity",
+            "is_reason_allocation",
+            "is_documented_category_exception",
+            "din_is_new",
         ],
         "prohibited_predicate_fields": [
             "__evidence_hash",
@@ -3171,7 +3267,157 @@ PRODUCT_REQUEST_DISTILLERY_PROFILE: dict[str, Any] = {
             "case_",
             "pair_id",
             "workflow_request_key",
+            "date_created",
+            "source_group",
+            "source_date",
+            "din",
+            "min",
+            "unit_number",
+            "unit_name",
+            "description",
+            "supply_chain_description",
+            "conversion_item_description",
+            "pack",
+            "vendor",
+            "manufacturer",
+            "brand",
+            "reason_for_request",
+            "on_mog",
+            "input_action",
+            "input_if_in_stock_action",
+            "input_audit_action",
         ],
+        "documented_numeric_thresholds": {
+            "meets_criteria_num": [0.10],
+            "conversion_va_num": [0.10],
+            "usage_num": [10.0, 15.0],
+        },
+        "controlled_categorical_fields": [
+            "business_key",
+            "request_type_key",
+            "upstream_action_class",
+            "upstream_stock_action_class",
+            "upstream_audit_action_class",
+            "current_action_class",
+            "current_buysmart_key",
+        ],
+    },
+    "policy_stages": [
+        {
+            "stage": 1,
+            "code": "validation",
+            "name": "Validation and exclusions",
+            "fields": [
+                "business_key",
+                "request_type_key",
+                "upstream_action_class",
+                "upstream_stock_action_class",
+                "upstream_audit_action_class",
+            ],
+        },
+        {
+            "stage": 2,
+            "code": "business_branch",
+            "name": "Business and request branch",
+            "fields": [
+                "business_key",
+                "request_type_key",
+                "is_levy",
+                "is_schools",
+            ],
+        },
+        {
+            "stage": 3,
+            "code": "enrichment_conversion",
+            "name": "Enrichment, conversion, and use-right",
+            "fields": [
+                "has_conversion",
+                "conversion_va_num",
+                "is_in_catalog",
+                "is_in_cat_y",
+                "is_temp_available",
+            ],
+        },
+        {
+            "stage": 4,
+            "code": "category_safety",
+            "name": "Category and safety exceptions",
+            "fields": [
+                "is_levy",
+                "is_schools",
+                "is_documented_category_exception",
+            ],
+        },
+        {
+            "stage": 5,
+            "code": "approval",
+            "name": "APL, pantry, manufacturer, and VA approval",
+            "fields": [
+                "is_pantry",
+                "is_k12_apl",
+                "is_core_apl",
+                "is_s1",
+                "is_foh",
+                "is_diverse",
+                "meets_criteria_num",
+                "conversion_va_num",
+                "is_reason_sponsorship",
+                "is_reason_menucycle",
+                "is_reason_commodity",
+                "is_reason_allocation",
+            ],
+        },
+        {
+            "stage": 6,
+            "code": "duration_resolution",
+            "name": "One-time and permanent resolution",
+            "fields": [
+                "usage_num",
+                "is_one_time",
+                "is_permanent",
+                "din_is_new",
+            ],
+        },
+        {
+            "stage": 7,
+            "code": "preservation_secondary",
+            "name": "Upstream-action preservation and secondary action",
+            "fields": [
+                "upstream_action_class",
+                "upstream_stock_action_class",
+                "upstream_audit_action_class",
+                "request_type_key",
+            ],
+        },
+    ],
+    "reference_contracts": [
+        "conversion_mappings",
+        "cookie_dough_matrix",
+        "bsb_supplier_matrix",
+        "bacon_sku_matrix",
+        "soup_min_list",
+        "approved_manufacturers_items",
+        "k12_apl",
+        "compass_apl",
+        "pantry",
+    ],
+    "mutation_classification_defaults": {
+        "Conversion Brand": "enrichment",
+        "Conversion Ceres ID": "enrichment",
+        "Conversion Ceres Catalog ID": "enrichment",
+        "Conversion DIN": "enrichment",
+        "Conversion Description": "enrichment",
+        "Conversion Item Description": "enrichment",
+        "Conversion Manufacturer": "enrichment",
+        "Conversion Mfr ID": "enrichment",
+        "Conversion MIN": "enrichment",
+        "Conversion Min": "enrichment",
+        "Conversion VA%": "enrichment",
+        "Meets Criteria": "enrichment",
+        "DIN": "correction",
+        "DPL": "enrichment",
+        "Pantry": "enrichment",
+        "Compass APL": "enrichment",
     },
     "feature_projector": "product_request",
 }
@@ -3222,6 +3468,15 @@ class DistilleryRule:
     kind: str
     evidence_ids: tuple[str, ...]
     validation_accuracy: float = 0.0
+    policy_stage: int = 0
+    policy_stage_code: str = ""
+    policy_clause_id: str = ""
+    rationale: str = ""
+    reference_dependencies: tuple[str, ...] = ()
+    output_effects: Mapping[str, Mapping[str, Any]] = dataclass_field(
+        default_factory=dict
+    )
+    amendment_status: str = ""
 
 
 @dataclass(frozen=True)
@@ -3293,6 +3548,27 @@ def distillery_action(value: Any) -> str:
         "BLANK": "",
     }
     return aliases.get(normalize_key(text), text)
+
+
+def semantic_action_class(value: Any) -> str:
+    key = normalize_key(value)
+    if not key:
+        return "blank"
+    if "ON MOG" in key:
+        return "on_mog"
+    if "CANNOT ADD" in key:
+        return "cannot_add"
+    if "FIND ALT" in key:
+        return "find_alt"
+    if "USE RIGHT" in key:
+        return "use_right"
+    if "1X" in key or "1 X" in key:
+        return "one_time"
+    if key in {"OK", "APPROVED"}:
+        return "approved"
+    if key in {"REVIEW", "ASSIGNED"}:
+        return "review"
+    return "other"
 
 
 def distillery_outcome_value(
@@ -3536,6 +3812,646 @@ def distillery_documents_from_upload(
             f"{file_name!r} contains no supported Distillery source files."
         )
     return tuple(documents)
+
+
+POLICY_SOURCE_EXTENSIONS = {"docx", "xlsx", "xlsm", "csv", "json"}
+REFERENCE_SOURCE_EXTENSIONS = {
+    "csv",
+    "tsv",
+    "txt",
+    "xlsx",
+    "xlsm",
+    "json",
+    "jsonl",
+    "ndjson",
+    "parquet",
+    "feather",
+}
+
+
+def distillery_docx_text(data: bytes) -> str:
+    """Extract normalized DOCX paragraphs without requiring python-docx."""
+    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+        document_xml = archive.read("word/document.xml")
+    root = ET.fromstring(document_xml)
+    paragraphs: list[str] = []
+    for paragraph in root.iter():
+        if _xml_local_name(paragraph.tag) != "p":
+            continue
+        text = "".join(
+            node.text or ""
+            for node in paragraph.iter()
+            if _xml_local_name(node.tag) in {"t", "tab", "br"}
+        )
+        text = re.sub(r"\s+", " ", text).strip()
+        if text:
+            paragraphs.append(text)
+    return "\n".join(paragraphs)
+
+
+def _policy_clause_value(
+    row: Mapping[str, Any],
+    *aliases: str,
+) -> Any:
+    values = {normalize_key(key): value for key, value in row.items()}
+    for alias in aliases:
+        key = normalize_key(alias)
+        if key in values and clean_text(values[key]):
+            return values[key]
+    return ""
+
+
+def normalize_policy_clause(
+    row: Mapping[str, Any],
+    source_name: str,
+    source_sha256: str,
+    row_number: int,
+) -> dict[str, Any]:
+    rule_id = clean_text(
+        _policy_clause_value(row, "Rule ID", "RuleId", "ID")
+    )
+    return {
+        "rule_id": rule_id,
+        "rule_group": clean_text(
+            _policy_clause_value(row, "Rule Group", "RuleGroup", "Stage")
+        ),
+        "business": clean_text(_policy_clause_value(row, "Business")),
+        "request_types": clean_text(
+            _policy_clause_value(
+                row,
+                "Request Types",
+                "Request Type (s)",
+                "RequestTypes",
+                "Type",
+            )
+        ),
+        "decision_criteria": clean_text(
+            _policy_clause_value(
+                row,
+                "Decision Criteria",
+                "DecisionCriteria",
+                "Filter Logic",
+            )
+        ),
+        "action": clean_text(_policy_clause_value(row, "ACTION", "Action")),
+        "if_in_stock_action": clean_text(
+            _policy_clause_value(
+                row,
+                "If In Stock Action",
+                "If In Stock: Action",
+                "If In-Stock Action",
+                "IfInStockAction",
+            )
+        ),
+        "buysmart_action": clean_text(
+            _policy_clause_value(
+                row,
+                "BuySmart Action",
+                "Buysmart Action",
+                "BuysmartAction",
+            )
+        ),
+        "daily_action_file_columns": clean_text(
+            _policy_clause_value(
+                row,
+                "Daily Action File Columns",
+                "DailyActionFileColumns",
+            )
+        ),
+        "set_action": clean_text(
+            _policy_clause_value(row, "Set ACTION", "SetAction")
+        ),
+        "downstream_handling": clean_text(
+            _policy_clause_value(
+                row,
+                "Downstream Handling",
+                "DownstreamHandling",
+            )
+        ),
+        "discovery_reference": clean_text(
+            _policy_clause_value(
+                row,
+                "Discovery Reference",
+                "Discovery Document Reference",
+                "DiscoveryReference",
+            )
+        ),
+        "notes": clean_text(
+            _policy_clause_value(row, "Notes", "Notes / Dependencies")
+        ),
+        "source": {
+            "file_name": source_name,
+            "sha256": source_sha256,
+            "row_number": row_number,
+        },
+        "raw": _plain_data(dict(row)),
+    }
+
+
+def distillery_policy_pack(
+    sources: Sequence[Mapping[str, Any]] | None,
+    profile: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Normalize policy documents into an immutable, citable policy pack."""
+    normalized_sources: list[dict[str, Any]] = []
+    clauses: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    for item in sources or []:
+        name = clean_text(item.get("name"))
+        data = item.get("data")
+        if not name or not isinstance(data, (bytes, bytearray)):
+            continue
+        content = bytes(data)
+        digest = hashlib.sha256(content).hexdigest()
+        extension = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+        try:
+            if extension == "docx":
+                text = distillery_docx_text(content)
+                record_count = len(text.splitlines())
+                source_clauses: list[dict[str, Any]] = []
+            elif extension in {"xlsx", "xlsm", "csv"}:
+                records = list(
+                    distillery_records_from_bytes(name, content)
+                )
+                data_start_row = 2
+                if records:
+                    first = records[0]
+                    header_map = {
+                        key: clean_text(value)
+                        for key, value in first.items()
+                        if clean_text(value)
+                    }
+                    if any(
+                        normalize_key(value) == "RULE ID"
+                        for value in header_map.values()
+                    ):
+                        data_start_row = 3
+                        records = [
+                            {
+                                header_map.get(key, clean_text(key)): value
+                                for key, value in record.items()
+                            }
+                            for record in records[1:]
+                        ]
+                source_clauses = [
+                    normalize_policy_clause(
+                        row,
+                        name,
+                        digest,
+                        row_number,
+                    )
+                    for row_number, row in enumerate(
+                        records,
+                        start=data_start_row,
+                    )
+                    if clean_text(
+                        _policy_clause_value(row, "Rule ID", "RuleId", "ID")
+                    )
+                ]
+                clauses.extend(source_clauses)
+                text = "\n".join(
+                    json.dumps(_plain_data(dict(row)), ensure_ascii=False)
+                    for row in records
+                )
+                record_count = len(records)
+            elif extension == "json":
+                payload = json.loads(content.decode("utf-8-sig"))
+                raw_records = (
+                    payload
+                    if isinstance(payload, list)
+                    else payload.get("clauses", [])
+                    if isinstance(payload, Mapping)
+                    else []
+                )
+                source_clauses = [
+                    normalize_policy_clause(
+                        dict(row),
+                        name,
+                        digest,
+                        row_number,
+                    )
+                    for row_number, row in enumerate(raw_records, start=1)
+                    if isinstance(row, Mapping)
+                ]
+                clauses.extend(source_clauses)
+                text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+                record_count = len(raw_records)
+            else:
+                raise ValueError(
+                    f"Unsupported policy source extension: {extension!r}"
+                )
+            normalized_sources.append(
+                {
+                    "file_name": name,
+                    "source_type": extension,
+                    "sha256": digest,
+                    "size_bytes": len(content),
+                    "normalized_content": text,
+                    "record_count": record_count,
+                    "clause_count": len(source_clauses),
+                }
+            )
+        except Exception as exc:
+            errors.append(
+                {
+                    "file_name": name,
+                    "sha256": digest,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+    clause_ids = {
+        clean_text(clause.get("rule_id")).upper()
+        for clause in clauses
+        if clean_text(clause.get("rule_id"))
+    }
+    duplicate_ids = sorted(
+        rule_id
+        for rule_id, count in Counter(
+            clean_text(clause.get("rule_id")).upper()
+            for clause in clauses
+            if clean_text(clause.get("rule_id"))
+        ).items()
+        if count > 1
+    )
+    pack_payload = {
+        "profile_id": clean_text(profile.get("profile_id")),
+        "profile_version": clean_text(profile.get("version")),
+        "sources": normalized_sources,
+        "clauses": clauses,
+        "clause_ids": sorted(clause_ids),
+        "duplicate_variant_ids": duplicate_ids,
+        "errors": errors,
+    }
+    pack_payload["sha256"] = hashlib.sha256(
+        json.dumps(
+            _plain_data(pack_payload),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    pack_payload["ready"] = bool(clauses) and not errors
+    pack_payload["source_count"] = len(normalized_sources)
+    pack_payload["clause_count"] = len(clauses)
+    return pack_payload
+
+
+def distillery_reference_contract_name(file_name: str) -> str:
+    stem = distillery_field(file_name.rsplit(".", 1)[0])
+    aliases = {
+        "conversion": "conversion_mappings",
+        "cookie": "cookie_dough_matrix",
+        "bsb": "bsb_supplier_matrix",
+        "bacon": "bacon_sku_matrix",
+        "soup": "soup_min_list",
+        "manufacturer": "approved_manufacturers_items",
+        "k12": "k12_apl",
+        "compass": "compass_apl",
+        "pantry": "pantry",
+    }
+    for token, contract in aliases.items():
+        if token in stem:
+            return contract
+    return stem
+
+
+def distillery_reference_datasets(
+    sources: Sequence[Mapping[str, Any]] | None,
+    mappings: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    datasets: dict[str, Any] = {}
+    errors: list[dict[str, Any]] = []
+    explicit = {
+        clean_text(name): clean_text(contract)
+        for name, contract in (mappings or {}).items()
+        if clean_text(name) and clean_text(contract)
+    }
+    for item in sources or []:
+        name = clean_text(item.get("name"))
+        data = item.get("data")
+        if not name or not isinstance(data, (bytes, bytearray)):
+            continue
+        content = bytes(data)
+        digest = hashlib.sha256(content).hexdigest()
+        contract = (
+            clean_text(item.get("contract"))
+            or explicit.get(name)
+            or distillery_reference_contract_name(name)
+        )
+        try:
+            rows = [
+                _plain_data(dict(row))
+                for row in distillery_records_from_bytes(name, content)
+            ]
+            columns = sorted(
+                {
+                    clean_text(column)
+                    for row in rows
+                    for column in row
+                    if clean_text(column)
+                }
+            )
+            row_hashes = [
+                hashlib.sha256(
+                    json.dumps(
+                        row,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        default=json_default,
+                    ).encode("utf-8")
+                ).hexdigest()
+                for row in rows
+            ]
+            datasets[contract] = {
+                "contract": contract,
+                "source_kind": (
+                    clean_text(item.get("source_kind")) or "upload"
+                ),
+                "source_name": (
+                    clean_text(item.get("source_name")) or name
+                ),
+                "source_sha256": digest,
+                "columns": columns,
+                "row_count": len(rows),
+                "rows": rows,
+                "row_hashes": row_hashes,
+                "status": "pending_approval",
+            }
+        except Exception as exc:
+            errors.append(
+                {
+                    "contract": contract,
+                    "source_name": name,
+                    "source_sha256": digest,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+    return {
+        "datasets": datasets,
+        "errors": errors,
+        "dataset_count": len(datasets),
+    }
+
+
+def distillery_mutation_inventory(
+    pairs: Sequence[DistilleryPair],
+    profile: Mapping[str, Any],
+    overrides: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    defaults = profile.get("mutation_classification_defaults") or {}
+    selected = {
+        clean_text(name): clean_text(value).lower()
+        for name, value in (overrides or {}).items()
+        if clean_text(name)
+    }
+    counts = Counter(
+        field for pair in pairs for field in pair.changed_input_fields
+    )
+    records: list[dict[str, Any]] = []
+    for name, count in counts.most_common():
+        classification = (
+            selected.get(name) or clean_text(defaults.get(name)).lower()
+        )
+        records.append(
+            {
+                "field_name": name,
+                "changed_rows": int(count),
+                "classification": classification or "unresolved",
+                "status": (
+                    "classified" if classification else "review_required"
+                ),
+            }
+        )
+    return {
+        "records": records,
+        "changed_field_count": len(records),
+        "unresolved_count": sum(
+            item["classification"] == "unresolved" for item in records
+        ),
+        "counts": dict(counts.most_common()),
+    }
+
+
+def distillery_enrich_projected_rows(
+    rows: Sequence[DistilleryProjected],
+    reference_pack: Mapping[str, Any] | None,
+) -> tuple[tuple[DistilleryProjected, ...], dict[str, Any]]:
+    datasets = (reference_pack or {}).get("datasets") or {}
+    indexes: dict[
+        str,
+        dict[str, dict[str, list[Mapping[str, Any]]]],
+    ] = {}
+    contradictions: list[dict[str, Any]] = []
+    identity_fields = (
+        "din",
+        "min",
+        "manufacturer",
+        "brand",
+        "vendor",
+        "description",
+    )
+    for contract, dataset in datasets.items():
+        contract_indexes: dict[
+            str,
+            dict[str, list[Mapping[str, Any]]],
+        ] = {
+            field_name: defaultdict(list)
+            for field_name in identity_fields
+        }
+        for raw_record in (dataset or {}).get("rows") or []:
+            if not isinstance(raw_record, Mapping):
+                continue
+            record = {
+                distillery_field(key): value
+                for key, value in raw_record.items()
+            }
+            for field_name in identity_fields:
+                value = normalize_key(record.get(field_name))
+                if value:
+                    contract_indexes[field_name][value].append(record)
+        for field_name, values in contract_indexes.items():
+            for key, matches in values.items():
+                signatures = {
+                    json.dumps(
+                        _plain_data(dict(match)),
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    for match in matches
+                }
+                if len(signatures) > 1:
+                    contradictions.append(
+                        {
+                            "contract": clean_text(contract),
+                            "identity_field": field_name,
+                            "identity_value": key,
+                            "record_count": len(matches),
+                            "reason": (
+                                "One governed identity maps to multiple "
+                                "reference records."
+                            ),
+                        }
+                    )
+        indexes[clean_text(contract)] = contract_indexes
+    enriched: list[DistilleryProjected] = []
+    matched_counts: Counter[str] = Counter()
+    for projected in rows:
+        features = dict(projected.features)
+        before = {
+            distillery_field(key): value
+            for key, value in projected.pair.before.items()
+        }
+        for contract, contract_indexes in indexes.items():
+            match: Mapping[str, Any] | None = None
+            for field_name in identity_fields:
+                value = normalize_key(
+                    before.get(field_name, features.get(field_name))
+                )
+                candidates = contract_indexes[field_name].get(value, [])
+                if value and len(candidates) == 1:
+                    match = candidates[0]
+                    break
+            reference_field = f"ref_{distillery_field(contract)}"
+            features[reference_field] = match is not None
+            if match is None:
+                continue
+            matched_counts[contract] += 1
+            if contract == "conversion_mappings":
+                conversion_din = first_text(
+                    match.get("conversion_din"),
+                    match.get("converted_din"),
+                    match.get("target_din"),
+                    match.get("din"),
+                )
+                conversion_va = first_text(
+                    match.get("conversion_va"),
+                    match.get("conversion_va_pct"),
+                    match.get("va"),
+                    match.get("va_pct"),
+                )
+                if conversion_din:
+                    features["conversion_din"] = conversion_din
+                    features["has_conversion"] = True
+                if conversion_va:
+                    features["conversion_va_num"] = distillery_number(
+                        conversion_va
+                    )
+            elif contract == "k12_apl":
+                features["is_k12_apl"] = True
+            elif contract == "compass_apl":
+                apl_text = " ".join(
+                    clean_text(value) for value in match.values()
+                ).lower()
+                features["is_core_apl"] = (
+                    features.get("is_core_apl")
+                    or "core apl" in apl_text
+                )
+                features["is_s1"] = (
+                    features.get("is_s1")
+                    or bool(re.search(r"\bs1\b", apl_text, re.I))
+                )
+                features["is_foh"] = (
+                    features.get("is_foh")
+                    or "front of house" in apl_text
+                    or bool(re.search(r"\bfoh\b", apl_text, re.I))
+                )
+                features["is_diverse"] = (
+                    features.get("is_diverse")
+                    or "diverse" in apl_text
+                )
+            elif contract == "pantry":
+                features["is_pantry"] = True
+        enriched.append(
+            DistilleryProjected(
+                pair=projected.pair,
+                features=features,
+                label=projected.label,
+            )
+        )
+    dataset_hashes = {
+        clean_text(contract): clean_text(
+            (dataset or {}).get("source_sha256")
+        )
+        for contract, dataset in datasets.items()
+    }
+    return tuple(enriched), {
+        "dataset_hashes": dataset_hashes,
+        "matched_rows_by_contract": dict(matched_counts),
+        "contradiction_count": len(contradictions),
+        "contradictions": contradictions,
+        "deterministic": True,
+    }
+
+
+def distillery_reference_row_proposals(
+    pairs: Sequence[DistilleryPair],
+    missing_contracts: Sequence[str],
+) -> list[dict[str, Any]]:
+    missing = {clean_text(value) for value in missing_contracts}
+    field_contracts = {
+        "Conversion Brand": "conversion_mappings",
+        "Conversion Ceres ID": "conversion_mappings",
+        "Conversion DIN": "conversion_mappings",
+        "Conversion Description": "conversion_mappings",
+        "Conversion Manufacturer": "conversion_mappings",
+        "Conversion Mfr ID": "conversion_mappings",
+        "Conversion MIN": "conversion_mappings",
+        "Conversion VA%": "conversion_mappings",
+        "Meets Criteria": "approved_manufacturers_items",
+        "Pantry": "pantry",
+        "Compass APL": "compass_apl",
+    }
+    grouped: dict[tuple[str, str, str, str], set[str]] = defaultdict(set)
+    for pair in pairs:
+        identity = first_text(
+            pair.before.get("DIN"),
+            pair.before.get("MIN"),
+        )
+        identity_field = (
+            "DIN" if clean_text(pair.before.get("DIN")) else "MIN"
+        )
+        if not identity:
+            continue
+        for field_name in pair.changed_input_fields:
+            contract = field_contracts.get(field_name)
+            final_value = clean_text(pair.after.get(field_name))
+            if contract not in missing or not final_value:
+                continue
+            grouped[
+                (
+                    contract,
+                    identity_field,
+                    normalize_key(identity),
+                    final_value,
+                )
+            ].add(pair.source_group)
+    proposals: list[dict[str, Any]] = []
+    for (
+        contract,
+        identity_field,
+        identity_value,
+        final_value,
+    ), groups in sorted(grouped.items()):
+        signature = hashlib.sha256(
+            "|".join(
+                [contract, identity_field, identity_value, final_value]
+            ).encode("utf-8")
+        ).hexdigest()
+        proposals.append(
+            {
+                "proposal_signature": signature,
+                "contract": contract,
+                "identity_field": identity_field,
+                "identity_value": identity_value,
+                "proposed_value": final_value,
+                "supporting_dates": sorted(groups),
+                "support_date_count": len(groups),
+                "status": "pending_approval",
+            }
+        )
+    return proposals
 
 
 def distillery_non_output_fields(
@@ -3883,6 +4799,7 @@ def distillery_product_request_features(
     in_cat = clean_text(values.get("in_cat")).lower()
     duration = clean_text(values.get("one_time_or_permanent"))
     conversion_din = clean_text(values.get("conversion_din"))
+
     values.update(
         {
             "business_key": normalize_key(business),
@@ -3914,6 +4831,32 @@ def distillery_product_request_features(
             "is_levy": "levy" in sector or "levy" in division,
             "is_schools": "school" in division
             or "chartwells" in division,
+            "upstream_action_class": semantic_action_class(
+                values.get("input_action")
+            ),
+            "upstream_stock_action_class": semantic_action_class(
+                values.get("input_if_in_stock_action")
+            ),
+            "upstream_audit_action_class": semantic_action_class(
+                values.get("input_audit_action")
+            ),
+            "is_reason_sponsorship": "sponsorship"
+            in clean_text(values.get("reason_for_request")).lower(),
+            "is_reason_menucycle": "menucycle"
+            in clean_text(values.get("reason_for_request")).lower(),
+            "is_reason_commodity": "commodity"
+            in clean_text(values.get("reason_for_request")).lower(),
+            "is_reason_allocation": "allocation"
+            in clean_text(values.get("reason_for_request")).lower(),
+            "is_documented_category_exception": bool(
+                re.search(
+                    r"halal|gluten free|sugar free|vegan|kosher|"
+                    r"\bgf\b|puree|nutritional",
+                    clean_text(values.get("description")),
+                    re.I,
+                )
+            ),
+            "din_is_new": "new" in clean_text(values.get("din")).lower(),
         }
     )
     return values
@@ -4795,6 +5738,73 @@ def literal_filter_name(
     return f"{profile_name} — {filters} — {outcome}"
 
 
+def distillery_policy_atom_allowed(
+    atom: DistilleryAtom,
+    profile: Mapping[str, Any],
+) -> bool:
+    """Enforce the governed predicate boundary before a candidate exists."""
+    config = profile.get("induction") or {}
+    field_name = clean_text(atom.field)
+    prohibited = {
+        clean_text(value)
+        for value in config.get("prohibited_predicate_fields") or []
+        if clean_text(value)
+    }
+    lowered = field_name.lower()
+    if (
+        not field_name
+        or field_name in prohibited
+        or lowered.startswith("__")
+        or any(
+            token in lowered
+            for token in (
+                "case_number",
+                "pair_id",
+                "source_date",
+                "source_group",
+                "evidence_hash",
+                "sha",
+            )
+        )
+    ):
+        return False
+    if atom.operator in DATE_OPERATORS or lowered == "date_created":
+        return False
+    if atom.operator in {"contains", "not_contains", "regex", "not_regex"}:
+        return False
+    thresholds = config.get("documented_numeric_thresholds") or {}
+    if atom.operator in NUMERIC_OPERATORS:
+        allowed = [
+            float(value)
+            for value in thresholds.get(field_name, [])
+            if distillery_number(value) is not None
+        ]
+        candidate = distillery_number(atom.value)
+        return (
+            candidate is not None
+            and any(math.isclose(candidate, value) for value in allowed)
+        )
+    if atom.operator in {"eq", "ne", "in", "not_in"}:
+        controlled = {
+            clean_text(value)
+            for value in config.get("controlled_categorical_fields") or []
+            if clean_text(value)
+        }
+        return (
+            field_name in controlled
+            or field_name.startswith("is_")
+            or field_name.startswith("ref_")
+        )
+    return atom.operator in {
+        "blank",
+        "not_blank",
+        "is_true",
+        "is_false",
+        "in_ref",
+        "not_in_ref",
+    }
+
+
 class LiteralFilterMiner:
     """Discover readable pure conjunctions for literal AFTER permutations."""
 
@@ -4876,6 +5886,8 @@ class LiteralFilterMiner:
         for atom in indexer.candidate_atoms(tuple(range(len(self.rows)))):
             if atom.field in prohibited or atom.field not in governed:
                 continue
+            if not distillery_policy_atom_allowed(atom, literal_profile):
+                continue
             signature = literal_atom_signature(atom)
             if signature in seen:
                 continue
@@ -4884,6 +5896,33 @@ class LiteralFilterMiner:
             if not coverage or len(coverage) == len(self.rows):
                 continue
             atoms.append((atom, self.mask_for_indexes(coverage)))
+        for numeric_field, thresholds in (
+            induction.get("documented_numeric_thresholds") or {}
+        ).items():
+            if numeric_field not in governed:
+                continue
+            for threshold in thresholds or []:
+                for operator in ("lt", "le", "ge", "gt"):
+                    atom = DistilleryAtom(
+                        clean_text(numeric_field),
+                        operator,
+                        threshold,
+                    )
+                    if not distillery_policy_atom_allowed(
+                        atom,
+                        literal_profile,
+                    ):
+                        continue
+                    signature = literal_atom_signature(atom)
+                    if signature in seen:
+                        continue
+                    seen.add(signature)
+                    coverage = indexer.coverage_for_atom(atom)
+                    if not coverage or len(coverage) == len(self.rows):
+                        continue
+                    atoms.append(
+                        (atom, self.mask_for_indexes(coverage))
+                    )
         self.atom_coverages = sorted(
             atoms,
             key=lambda item: literal_atom_signature(item[0]),
@@ -5617,7 +6656,9 @@ class LiteralFilterMiner:
                     "before_index": row.pair.before_index,
                     "after_index": row.pair.after_index,
                     "expected_outcome": dict(row.label),
-                    "reason": "No globally pure governed-field filter covered this evidence row.",
+                    "reason": (
+                        "No governed semantic filter covered this evidence row."
+                    ),
                     "evidence": {
                         "case": clean_text(row.pair.before.get("Case#")),
                         "business": clean_text(row.pair.before.get("Business")),
@@ -5639,6 +6680,400 @@ class LiteralFilterMiner:
                 }
                 for group, counts in sorted(permutations.items())
             },
+        }
+
+
+def distillery_policy_stage_for_clause(clause: Mapping[str, Any]) -> int:
+    text = normalize_key(
+        " ".join(
+            [
+                clean_text(clause.get("rule_group")),
+                clean_text(clause.get("decision_criteria")),
+                clean_text(clause.get("set_action")),
+            ]
+        )
+    )
+    if any(token in text for token in ("PRE PROCESS", "VALIDAT", "EXCLUSION")):
+        return 1
+    if any(token in text for token in ("BUSINESS", "REQUEST BRANCH")):
+        return 2
+    if any(token in text for token in ("CONVERSION", "USE RIGHT", "MYORDERS")):
+        return 3
+    if any(token in text for token in ("CATEGORY", "MANUFACTURER", "SAFETY")):
+        return 4
+    if any(token in text for token in ("APL", "PANTRY", "CRITERIA", "PREFERRED")):
+        return 5
+    if any(token in text for token in ("ONE TIME", "PERMANENT", "ACTION ASSIGN")):
+        return 6
+    if any(token in text for token in ("CLOSEOUT", "PRESERV", "SECONDARY")):
+        return 7
+    return 0
+
+
+def distillery_rule_source_clause(
+    rule: DistilleryRule,
+    stage: int,
+    policy_pack: Mapping[str, Any],
+) -> Mapping[str, Any] | None:
+    field_terms = {
+        "business_key": ("BUSINESS",),
+        "request_type_key": ("TYPE", "REQUEST TYPE"),
+        "is_levy": ("SECTOR", "DIVISION", "LEVY"),
+        "is_schools": ("DIVISION", "K12", "SCHOOL", "CHARTWELLS"),
+        "has_conversion": ("CONVERSION DIN", "CONVERSION"),
+        "conversion_va_num": ("CONVERSION VA", "VA"),
+        "is_in_catalog": ("IN CAT", "CATALOG"),
+        "is_in_cat_y": ("IN CAT", "CATALOG"),
+        "is_temp_available": ("IN CAT", "TEMP AVAILABLE"),
+        "is_pantry": ("PANTRY",),
+        "is_k12_apl": ("K12 APL",),
+        "is_core_apl": ("COMPASS APL", "CORE APL"),
+        "is_s1": ("COMPASS APL", "S1"),
+        "is_foh": ("COMPASS APL", "FOH", "FRONT OF HOUSE"),
+        "is_diverse": ("COMPASS APL", "DIVERSE"),
+        "meets_criteria_num": ("MEETS CRITERIA",),
+        "usage_num": ("USAGE",),
+        "is_one_time": ("ONE TIME", "ONE TIME OR PERMANENT"),
+        "is_permanent": ("PERMANENT", "ONE TIME OR PERMANENT"),
+        "upstream_action_class": ("ACTION",),
+        "upstream_stock_action_class": ("IF IN STOCK",),
+        "upstream_audit_action_class": ("AUDIT ACTION",),
+    }
+    output_values = {
+        normalize_key(value)
+        for value in rule.outputs.values()
+        if clean_text(value)
+    }
+    candidates: list[tuple[int, Mapping[str, Any]]] = []
+    for clause in policy_pack.get("clauses") or []:
+        if not isinstance(clause, Mapping):
+            continue
+        clause_stage = distillery_policy_stage_for_clause(clause)
+        if clause_stage not in {0, stage}:
+            continue
+        text = normalize_key(
+            " ".join(
+                clean_text(clause.get(key))
+                for key in (
+                    "decision_criteria",
+                    "action",
+                    "if_in_stock_action",
+                    "set_action",
+                    "notes",
+                )
+            )
+        )
+        field_text = normalize_key(
+            " ".join(
+                [
+                    clean_text(
+                        clause.get("daily_action_file_columns")
+                    ),
+                    clean_text(clause.get("decision_criteria")),
+                ]
+            )
+        )
+        matched_fields = sum(
+            any(term in field_text for term in field_terms.get(atom.field, ()))
+            for atom in rule.predicates
+        )
+        required_fields = max(1, math.ceil(len(rule.predicates) * 0.6))
+        output_score = sum(value in text for value in output_values)
+        if output_score and matched_fields >= required_fields:
+            candidates.append(
+                (output_score * 10 + matched_fields, clause)
+            )
+    return (
+        max(
+            candidates,
+            key=lambda item: (
+                item[0],
+                clean_text(item[1].get("rule_id")),
+            ),
+        )[1]
+        if candidates
+        else None
+    )
+
+
+def distillery_reference_dependencies_for_clause(
+    clause: Mapping[str, Any] | None,
+) -> tuple[str, ...]:
+    if not clause:
+        return ()
+    text = normalize_key(
+        " ".join(
+            clean_text(value)
+            for key, value in clause.items()
+            if key not in {"raw", "source"}
+        )
+    )
+    tokens = {
+        "conversion_mappings": ("CONVERSION", "USE RIGHT"),
+        "cookie_dough_matrix": ("COOKIE DOUGH", "CDM"),
+        "bsb_supplier_matrix": ("BSB", "SUPPLIER MATRIX"),
+        "bacon_sku_matrix": ("BACON",),
+        "soup_min_list": ("SOUP",),
+        "approved_manufacturers_items": (
+            "APPROVED MANUFACTURER",
+            "APPROVED ITEM",
+        ),
+        "k12_apl": ("K12",),
+        "compass_apl": ("COMPASS APL", "CORE APL", "S1", "FOH"),
+        "pantry": ("PANTRY",),
+    }
+    return tuple(
+        name
+        for name, aliases in tokens.items()
+        if any(alias in text for alias in aliases)
+    )
+
+
+def distillery_rule_output_effects(
+    rule: DistilleryRule,
+    evidence_rows: Sequence[DistilleryProjected],
+    profile: Mapping[str, Any],
+) -> dict[str, dict[str, Any]]:
+    contracts = {
+        clean_text(item.get("target")): clean_text(item.get("source"))
+        for item in profile.get("output_fields") or []
+    }
+    by_id = {row.pair.pair_id: row for row in evidence_rows}
+    selected = [
+        by_id[pair_id]
+        for pair_id in rule.evidence_ids
+        if pair_id in by_id
+    ]
+    output: dict[str, dict[str, Any]] = {}
+    for target, final_value in rule.outputs.items():
+        canonical_final = clean_text(final_value)
+        source_field = contracts.get(clean_text(target), "")
+        input_values = [
+            distillery_outcome_value(
+                clean_text(target),
+                row.pair.before.get(source_field),
+            )
+            for row in selected
+        ]
+        if input_values and all(
+            clean_text(value) == canonical_final for value in input_values
+        ):
+            effect = "preserve"
+        elif not canonical_final:
+            effect = "clear"
+        else:
+            effect = "set"
+        output[clean_text(target)] = {
+            "effect": effect,
+            "value": canonical_final,
+            "input_field": f"input_{clean_text(target)}",
+            "explicit_final_state": True,
+        }
+    return output
+
+
+class PolicyGroundedFilterMiner:
+    """Compile a visible policy-stage decision list over residual evidence."""
+
+    def __init__(
+        self,
+        profile: Mapping[str, Any],
+        policy_pack: Mapping[str, Any] | None = None,
+    ):
+        self.profile = deepcopy(dict(profile))
+        self.policy_pack = deepcopy(dict(policy_pack or {}))
+
+    def fit(
+        self,
+        rows: Sequence[DistilleryProjected],
+    ) -> dict[str, Any]:
+        all_rows = tuple(rows)
+        remaining = list(range(len(all_rows)))
+        compiled: list[DistilleryRule] = []
+        conflicts: list[dict[str, Any]] = []
+        convergence: list[dict[str, Any]] = []
+        permutations: dict[str, Any] = {}
+        sequence = 0
+        for stage_contract in self.profile.get("policy_stages") or []:
+            stage = int(stage_contract.get("stage") or 0)
+            stage_code = clean_text(stage_contract.get("code"))
+            stage_name = clean_text(stage_contract.get("name"))
+            stage_fields = [
+                clean_text(value)
+                for value in stage_contract.get("fields") or []
+                if clean_text(value)
+            ]
+            before_count = len(remaining)
+            if not remaining or not stage_fields:
+                convergence.append(
+                    {
+                        "stage": stage,
+                        "stage_code": stage_code,
+                        "stage_name": stage_name,
+                        "input_residual_rows": before_count,
+                        "rules_added": 0,
+                        "exact_rows_added": 0,
+                        "residual_rows": before_count,
+                        "conflicts": 0,
+                    }
+                )
+                continue
+            stage_profile = deepcopy(self.profile)
+            induction = stage_profile.setdefault("induction", {})
+            induction["governed_fields"] = stage_fields
+            induction["feature_fields"] = stage_fields
+            # Candidate purity is always measured against the full corpus.
+            # Only convergence accounting uses the current residual set. This
+            # prevents a later stage from regressing rows already explained by
+            # an earlier policy stage or matrix anchor.
+            stage_rows = all_rows
+            mined = LiteralFilterMiner(stage_profile).fit(stage_rows)
+            stage_rules: list[DistilleryRule] = []
+            for rule in mined.get("rules") or []:
+                if not any(
+                    SingleFileRuleInducer.predict(
+                        all_rows[index].features,
+                        [rule],
+                    )
+                    == dict(all_rows[index].label)
+                    for index in remaining
+                ):
+                    continue
+                sequence += 1
+                source_clause = distillery_rule_source_clause(
+                    rule,
+                    stage,
+                    self.policy_pack,
+                )
+                clause_id = clean_text(
+                    (source_clause or {}).get("rule_id")
+                )
+                dependencies = (
+                    distillery_reference_dependencies_for_clause(
+                        source_clause
+                    )
+                )
+                status = (
+                    "source_backed" if source_clause else "draft_amendment"
+                )
+                stage_rule = DistilleryRule(
+                    rule_id=rule.rule_id.replace(
+                        "LITERAL-",
+                        "POLICY-",
+                        1,
+                    ),
+                    priority=stage * 10_000 + sequence,
+                    predicates=rule.predicates,
+                    outputs=rule.outputs,
+                    support=rule.support,
+                    confidence=rule.confidence,
+                    source_groups=rule.source_groups,
+                    kind=rule.kind,
+                    evidence_ids=rule.evidence_ids,
+                    validation_accuracy=rule.validation_accuracy,
+                    policy_stage=stage,
+                    policy_stage_code=stage_code,
+                    policy_clause_id=clause_id,
+                    rationale=(
+                        clean_text(
+                            (source_clause or {}).get(
+                                "decision_criteria"
+                            )
+                        )
+                        or (
+                            "Repeated residual behavior using only governed "
+                            "semantic fields."
+                        )
+                    ),
+                    reference_dependencies=dependencies,
+                    output_effects=distillery_rule_output_effects(
+                        rule,
+                        stage_rows,
+                        self.profile,
+                    ),
+                    amendment_status=status,
+                )
+                stage_rules.append(stage_rule)
+            stage_conflicts = [
+                {
+                    **dict(item),
+                    "policy_stage": stage,
+                    "policy_stage_code": stage_code,
+                }
+                for item in mined.get("conflicts") or []
+            ]
+            conflicts.extend(stage_conflicts)
+            compiled.extend(stage_rules)
+            next_remaining: list[int] = []
+            exact_added = 0
+            for global_index in remaining:
+                row = all_rows[global_index]
+                predicted = SingleFileRuleInducer.predict(
+                    row.features,
+                    stage_rules,
+                )
+                if predicted == dict(row.label):
+                    exact_added += 1
+                else:
+                    next_remaining.append(global_index)
+            remaining = next_remaining
+            convergence.append(
+                {
+                    "stage": stage,
+                    "stage_code": stage_code,
+                    "stage_name": stage_name,
+                    "input_residual_rows": before_count,
+                    "rules_added": len(stage_rules),
+                    "exact_rows_added": exact_added,
+                    "residual_rows": len(remaining),
+                    "conflicts": len(stage_conflicts),
+                }
+            )
+            for group, values in (mined.get("permutations") or {}).items():
+                permutations.setdefault(group, values)
+        gaps: list[dict[str, Any]] = []
+        for global_index in remaining:
+            row = all_rows[global_index]
+            gaps.append(
+                {
+                    "gap_id": hashlib.sha256(
+                        f"{row.pair.pair_id}|policy-gap".encode("utf-8")
+                    ).hexdigest()[:24],
+                    "gap_type": "missing_policy_or_reference_context",
+                    "pair_id": row.pair.pair_id,
+                    "source_group": row.pair.source_group,
+                    "before_index": row.pair.before_index,
+                    "after_index": row.pair.after_index,
+                    "expected_outcome": dict(row.label),
+                    "reason": (
+                        "No source-backed or approved semantic filter explains "
+                        "this row after all policy stages."
+                    ),
+                    "missing_context_candidates": list(
+                        self.profile.get("reference_contracts") or []
+                    ),
+                    "evidence": {
+                        "business": clean_text(
+                            row.pair.before.get("Business")
+                        ),
+                        "type": clean_text(row.pair.before.get("Type")),
+                        "parent_category": clean_text(
+                            row.pair.before.get("Parent Category")
+                        ),
+                        "sub_category": clean_text(
+                            row.pair.before.get("Sub Category")
+                        ),
+                    },
+                }
+            )
+        return {
+            "rules": tuple(
+                sorted(compiled, key=lambda item: item.priority)
+            ),
+            "gaps": tuple(gaps),
+            "conflicts": tuple(conflicts),
+            "permutations": permutations,
+            "convergence": convergence,
         }
 
 
@@ -5746,6 +7181,67 @@ def literal_distillery_holdouts(
         ),
         "minimum_accuracy": min(accuracies) if accuracies else 0.0,
         "maximum_accuracy": max(accuracies) if accuracies else 0.0,
+    }
+
+
+def policy_grounded_holdouts(
+    rows: Sequence[DistilleryProjected],
+    profile: Mapping[str, Any],
+    policy_pack: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    groups = sorted({row.pair.source_group for row in rows})
+    governed = (
+        (profile.get("induction") or {}).get("governed_fields") or []
+    )
+    folds: dict[str, Any] = {}
+    for holdout in groups:
+        training = [
+            row for row in rows if row.pair.source_group != holdout
+        ]
+        testing = [row for row in rows if row.pair.source_group == holdout]
+        mined = PolicyGroundedFilterMiner(
+            profile,
+            policy_pack,
+        ).fit(training)
+        reusable = [
+            rule
+            for rule in mined["rules"]
+            if len(rule.source_groups) >= 2
+        ]
+        reusable_catalog = literal_distillery_catalog(
+            reusable,
+            profile,
+            f"holdout-{holdout}",
+            0.0,
+            ["*"],
+        )
+        scaffold = policy_scaffold_catalog(policy_pack or {}, profile)
+        validation = distillery_validate_catalog(
+            testing,
+            [*reusable_catalog, *scaffold],
+        )
+        folds[holdout] = {
+            "training_rows": len(training),
+            "testing_rows": len(testing),
+            "rule_count": len(reusable),
+            "training_gaps": len(mined["gaps"]),
+            "training_conflicts": len(mined["conflicts"]),
+            "accuracy": validation["accuracy"],
+            "exact": validation["exact_count"],
+            "uncovered": len(validation["uncovered_pair_ids"]),
+            "mismatched": len(validation["mismatched_pair_ids"]),
+        }
+    accuracies = [fold["accuracy"] for fold in folds.values()]
+    return {
+        "strategy": "mandatory-leave-one-date-out-policy-grounded",
+        "folds": folds,
+        "mean_accuracy": (
+            sum(accuracies) / len(accuracies) if accuracies else 0.0
+        ),
+        "minimum_accuracy": min(accuracies) if accuracies else 0.0,
+        "maximum_accuracy": max(accuracies) if accuracies else 0.0,
+        "reusable_rules_only": True,
+        "completed": len(folds) == len(groups) and bool(groups),
     }
 
 
@@ -5959,20 +7455,39 @@ def literal_distillery_catalog(
     ):
         signature = literal_logic_signature(rule.predicates, rule.outputs)
         approved = (
-            rule.kind == "reusable"
-            or approve_all
+            approve_all
             or signature.lower() in approvals
+            or (
+                rule.kind == "reusable"
+                and clean_text(rule.amendment_status)
+                != "draft_amendment"
+            )
         )
         status = "approved" if approved else "ready"
-        actions = [
-            {
-                "type": clean_text(output_contract[target].get("action_type")),
-                "value": clean_text(value),
-                "explicit_final_state": True,
-            }
-            for target, value in rule.outputs.items()
-            if target in output_contract
-        ]
+        actions: list[dict[str, Any]] = []
+        for target, value in rule.outputs.items():
+            if target not in output_contract:
+                continue
+            effect_contract = dict(
+                (rule.output_effects or {}).get(target) or {}
+            )
+            actions.append(
+                {
+                    "type": clean_text(
+                        output_contract[target].get("action_type")
+                    ),
+                    "value": clean_text(value),
+                    "effect": (
+                        clean_text(effect_contract.get("effect"))
+                        or ("clear" if not clean_text(value) else "set")
+                    ),
+                    "input_field": (
+                        clean_text(effect_contract.get("input_field"))
+                        or f"input_{target}"
+                    ),
+                    "explicit_final_state": True,
+                }
+            )
         predicate = distillery_predicate_json(
             rule.predicates,
             profile_id,
@@ -5984,12 +7499,19 @@ def literal_distillery_catalog(
         )
         source = {
             "kind": "rules_distillery",
-            "method": "literal_filter_reconstruction",
+            "method": "policy_grounded_stage_residual_reconstruction",
             "ruleset_id": profile_id,
             "ruleset_version": clean_text(profile.get("version")),
             "distillation_run_id": run_id,
             "distillery_version": DISTILLERY_VERSION,
             "distilled_rule_kind": rule.kind,
+            "policy_stage": int(rule.policy_stage or 0),
+            "policy_stage_code": clean_text(rule.policy_stage_code),
+            "policy_clause_id": clean_text(rule.policy_clause_id),
+            "rationale": clean_text(rule.rationale),
+            "reference_dependencies": list(rule.reference_dependencies),
+            "output_effects": _plain_data(dict(rule.output_effects or {})),
+            "amendment_status": clean_text(rule.amendment_status),
             "logic_signature": signature,
             "support": rule.support,
             "confidence": 1.0,
@@ -5997,10 +7519,23 @@ def literal_distillery_catalog(
             "source_groups": list(rule.source_groups),
             "evidence_count": len(rule.evidence_ids),
             "holdout_accuracy": holdout_accuracy,
-            "approval_required": rule.kind == "one_date",
+            "approval_required": (
+                rule.kind == "one_date"
+                or clean_text(rule.amendment_status) == "draft_amendment"
+            ),
             "approved": approved,
             "filter_logic": filter_logic_text(predicate),
             "outcome": _plain_data(rule.outputs),
+            "semantic_outcome_code": (
+                "PR-"
+                + hashlib.sha256(
+                    json.dumps(
+                        _plain_data(rule.outputs),
+                        sort_keys=True,
+                        ensure_ascii=False,
+                    ).encode("utf-8")
+                ).hexdigest()[:10].upper()
+            ),
         }
         rule_uuid = str(
             uuid.uuid5(
@@ -6013,15 +7548,19 @@ def literal_distillery_catalog(
                 "id": rule_uuid,
                 "rule_id": rule.rule_id,
                 "name": name,
-                "rule_group": f"Literal Filters · {profile_id}",
+                "rule_group": (
+                    f"Policy Stage {int(rule.policy_stage or 0)} · "
+                    f"{clean_text(rule.policy_stage_code) or profile_id}"
+                ),
                 "business_scope": "Profile-defined",
                 "request_types": [],
                 "discovery_reference": (
-                    "Per-date BEFORE/AFTER literal filter reconstruction"
+                    "Policy-stage residual reconstruction over dated evidence"
                 ),
                 "notes": (
-                    "Minimal globally pure governed-field filter. "
-                    "No evidence fingerprint or row identity predicate."
+                    "Minimal stage-scoped governed semantic filter. No "
+                    "identity, source-date, raw-note, arbitrary product-text, "
+                    "or sampled-threshold predicate."
                 ),
                 "owner_team": "ONE ENGINE",
                 "status": status,
@@ -6043,7 +7582,11 @@ def literal_distillery_catalog(
                         "rule_id": rule.rule_id,
                         "runtime_rule_id": f"{rule.rule_id}.01",
                         "runtime_kind": "row_rule",
-                        "execution_priority": 100_000 + priority,
+                        "execution_priority": (
+                            int(rule.policy_stage or 1) * 10_000
+                            + 1_000
+                            + priority
+                        ),
                         "enabled": approved,
                         "is_executable": True,
                         "stop_processing": True,
@@ -6077,6 +7620,443 @@ def candidate_catalog_for_test(
     return output
 
 
+def policy_scaffold_catalog(
+    policy_pack: Mapping[str, Any],
+    profile: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Compile the known matrix anchors without treating them as complete."""
+    def semantic_predicate(
+        predicate: Mapping[str, Any] | None,
+    ) -> Mapping[str, Any] | None:
+        if not isinstance(predicate, Mapping):
+            return predicate
+        if isinstance(predicate.get("all"), list):
+            return {
+                "all": [
+                    semantic_predicate(item)
+                    for item in predicate.get("all") or []
+                    if isinstance(item, Mapping)
+                ]
+            }
+        if isinstance(predicate.get("any"), list):
+            return {
+                "any": [
+                    semantic_predicate(item)
+                    for item in predicate.get("any") or []
+                    if isinstance(item, Mapping)
+                ]
+            }
+        if isinstance(predicate.get("not"), Mapping):
+            return {
+                "not": semantic_predicate(predicate.get("not"))
+            }
+        field_name = clean_text(predicate.get("field"))
+        operator = clean_text(predicate.get("op"))
+        value = normalize_key(predicate.get("value"))
+        reason_flags = {
+            "SPONSORSHIP": "is_reason_sponsorship",
+            "MENUCYCLE": "is_reason_menucycle",
+            "COMMODITY": "is_reason_commodity",
+            "ALLOCATION": "is_reason_allocation",
+        }
+        if field_name == "reason_lc" and value in reason_flags:
+            return {
+                "field": reason_flags[value],
+                "op": "is_true"
+                if operator == "contains"
+                else "is_false",
+            }
+        if field_name == "description_lc" and operator == "regex":
+            return {
+                "field": "is_documented_category_exception",
+                "op": "is_true",
+            }
+        if field_name == "din_lc" and value == "NEW":
+            return {
+                "field": "din_is_new",
+                "op": (
+                    "is_false"
+                    if operator == "not_contains"
+                    else "is_true"
+                ),
+            }
+        if field_name == "current_action_key":
+            return {
+                "field": "current_action_class",
+                "op": "eq",
+                "value": semantic_action_class(predicate.get("value")),
+            }
+        return deepcopy(dict(predicate))
+
+    seed_rules, _ = build_seed_catalog()
+    clauses_by_id: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+    for clause in policy_pack.get("clauses") or []:
+        if isinstance(clause, Mapping):
+            clauses_by_id[
+                clean_text(clause.get("rule_id")).upper()
+            ].append(clause)
+    output: list[dict[str, Any]] = []
+    for rule_index, seed_rule in enumerate(seed_rules, start=1):
+        rule = deepcopy(seed_rule)
+        rule_id = clean_text(rule.get("rule_id")).upper()
+        clauses = clauses_by_id.get(rule_id, [])
+        if not clauses:
+            continue
+        stage = next(
+            (
+                distillery_policy_stage_for_clause(clause)
+                for clause in clauses
+                if distillery_policy_stage_for_clause(clause)
+            ),
+            1,
+        )
+        dependencies = sorted(
+            {
+                dependency
+                for clause in clauses
+                for dependency in (
+                    distillery_reference_dependencies_for_clause(clause)
+                )
+            }
+        )
+        lineage = {
+            "kind": "policy_scaffold",
+            "method": "uploaded_matrix_anchor_compilation",
+            "ruleset_id": clean_text(profile.get("profile_id")),
+            "ruleset_version": clean_text(profile.get("version")),
+            "policy_pack_sha256": clean_text(
+                policy_pack.get("sha256")
+            ),
+            "policy_stage": stage,
+            "policy_stage_code": next(
+                (
+                    clean_text(item.get("code"))
+                    for item in profile.get("policy_stages") or []
+                    if int(item.get("stage") or 0) == stage
+                ),
+                "",
+            ),
+            "policy_clause_id": rule_id,
+            "clause_variants": _plain_data(clauses),
+            "reference_dependencies": dependencies,
+            "partial_scaffold": True,
+            "catalog_completeness_claim": False,
+        }
+        rule["is_bundled"] = False
+        rule["ruleset_id"] = clean_text(profile.get("profile_id"))
+        rule["rule_group"] = (
+            f"Policy Stage {stage} · "
+            f"{clean_text(rule.get('rule_group'))}"
+        )
+        rule["notes"] = (
+            f"{clean_text(rule.get('notes'))} "
+            "Uploaded matrix anchor; residual discovery remains mandatory."
+        ).strip()
+        rule["source"] = lineage
+        for variant_index, variant in enumerate(
+            rule.get("variants") or [],
+            start=1,
+        ):
+            if not isinstance(variant, MutableMapping):
+                continue
+            original_priority = int(
+                variant.get("execution_priority") or rule_index * 100
+            )
+            variant["execution_priority"] = (
+                stage * 10_000
+                + 5_000
+                + (original_priority % 5_000)
+                + variant_index
+            )
+            variant["predicate_json"] = semantic_predicate(
+                variant.get("predicate_json")
+            )
+            variant["source"] = lineage
+        output.append(rule)
+    return output
+
+
+def distillery_validate_catalog(
+    rows: Sequence[DistilleryProjected],
+    catalog: Sequence[Mapping[str, Any]],
+    reference_lists: Mapping[str, Sequence[str]] | None = None,
+) -> dict[str, Any]:
+    exact = 0
+    matched = 0
+    uncovered: list[str] = []
+    mismatched: list[str] = []
+    by_group: dict[str, Counter[str]] = defaultdict(Counter)
+    terminal_failures: list[dict[str, Any]] = []
+    variants = executable_variants(catalog)
+    for row in rows:
+        workflow_row = create_workflow_row(
+            "distillery-corpus-validation",
+            row.pair.before,
+            row.pair.before_index + 2,
+        )
+        executed = execute_row(
+            workflow_row,
+            variants,
+            reference_lists,
+        )
+        predicted = {
+            "action": clean_text(executed.get("action")),
+            "if_in_stock_action": clean_text(
+                executed.get("if_in_stock_action")
+            ),
+            "audit_action": clean_text(executed.get("audit_action")),
+        }
+        expected = dict(row.label)
+        stats = by_group[row.pair.source_group]
+        stats["rows"] += 1
+        trace = executed.get("execution_trace") or []
+        if not trace:
+            uncovered.append(row.pair.pair_id)
+            stats["uncovered"] += 1
+        else:
+            matched += 1
+            stats["matched"] += 1
+        if predicted == expected:
+            exact += 1
+            stats["exact"] += 1
+        else:
+            mismatched.append(row.pair.pair_id)
+            stats["mismatched"] += 1
+            terminal_failures.append(
+                {
+                    "pair_id": row.pair.pair_id,
+                    "source_group": row.pair.source_group,
+                    "expected_outcome": expected,
+                    "observed_outcome": predicted,
+                    "terminal_trace": _plain_data(trace),
+                }
+            )
+    row_count = len(rows)
+    return {
+        "row_count": row_count,
+        "matched_count": matched,
+        "exact_count": exact,
+        "accuracy": exact / row_count if row_count else 0.0,
+        "contradictions": 0,
+        "uncovered_pair_ids": uncovered,
+        "mismatched_pair_ids": mismatched,
+        "terminal_path_failures": terminal_failures,
+        "by_source_group": {
+            group: {
+                **dict(stats),
+                "accuracy": (
+                    stats["exact"] / stats["rows"]
+                    if stats["rows"]
+                    else 0.0
+                ),
+            }
+            for group, stats in sorted(by_group.items())
+        },
+    }
+
+
+def distillery_catalog_predicate_violations(
+    catalog: Sequence[Mapping[str, Any]],
+    profile: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    violations: list[dict[str, Any]] = []
+
+    def walk(
+        node: Mapping[str, Any] | None,
+        rule_id: str,
+    ) -> None:
+        if not isinstance(node, Mapping):
+            return
+        for operator in ("all", "any"):
+            for child in node.get(operator) or []:
+                if isinstance(child, Mapping):
+                    walk(child, rule_id)
+        if isinstance(node.get("not"), Mapping):
+            walk(node.get("not"), rule_id)
+        field_name = clean_text(node.get("field"))
+        operator = clean_text(node.get("op"))
+        if not field_name or field_name == "__ruleset_id":
+            return
+        atom = DistilleryAtom(field_name, operator, node.get("value"))
+        if not distillery_policy_atom_allowed(atom, profile):
+            violations.append(
+                {
+                    "rule_id": rule_id,
+                    "field": field_name,
+                    "operator": operator,
+                    "value": _plain_data(node.get("value")),
+                    "reason": "Predicate is outside the governed policy boundary.",
+                }
+            )
+
+    for rule in catalog:
+        rule_id = clean_text(rule.get("rule_id"))
+        for variant in rule.get("variants") or []:
+            if isinstance(variant, Mapping):
+                walk(variant.get("predicate_json"), rule_id)
+    return violations
+
+
+def distillery_metamorphic_tests(
+    rows: Sequence[DistilleryProjected],
+    rules: Sequence[DistilleryRule],
+) -> dict[str, Any]:
+    mutations = {
+        "case_number": "META-CHANGED",
+        "date_created": "2099-12-31",
+        "source_group": "META-SOURCE",
+        "reason_for_request": "irrelevant note changed",
+        "__evidence_hash": "META-SHA",
+    }
+    failures: list[dict[str, Any]] = []
+    for row in rows:
+        baseline = SingleFileRuleInducer.predict(row.features, rules)
+        mutated = dict(row.features)
+        mutated.update(mutations)
+        observed = SingleFileRuleInducer.predict(mutated, rules)
+        if baseline != observed:
+            failures.append(
+                {
+                    "pair_id": row.pair.pair_id,
+                    "source_group": row.pair.source_group,
+                    "baseline": _plain_data(baseline),
+                    "mutated": _plain_data(observed),
+                }
+            )
+    return {
+        "tests": len(rows),
+        "failure_count": len(failures),
+        "failures": failures[:100],
+        "mutated_fields": sorted(mutations),
+        "row_order_invariant": True,
+    }
+
+
+def distillery_catalog_metamorphic_tests(
+    rows: Sequence[DistilleryProjected],
+    catalog: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    variants = executable_variants(catalog)
+    failures: list[dict[str, Any]] = []
+    for row in rows:
+        baseline_row = create_workflow_row(
+            "metamorphic-baseline",
+            row.pair.before,
+            row.pair.before_index + 2,
+        )
+        mutated_source = dict(row.pair.before)
+        mutated_source["Case#"] = (
+            f"META-{row.pair.before_index:08d}"
+        )
+        mutated_source["Date Created"] = "2099-12-31"
+        mutated_source["Reason for request"] = (
+            clean_text(mutated_source.get("Reason for request"))
+            + " unrelated-neutral-note"
+        ).strip()
+        mutated_row = create_workflow_row(
+            "metamorphic-mutated",
+            mutated_source,
+            len(rows) - row.pair.before_index + 2,
+        )
+        baseline = execute_row(baseline_row, variants)
+        observed = execute_row(mutated_row, variants)
+        baseline_outcome = (
+            clean_text(baseline.get("action")),
+            clean_text(baseline.get("if_in_stock_action")),
+            clean_text(baseline.get("audit_action")),
+        )
+        observed_outcome = (
+            clean_text(observed.get("action")),
+            clean_text(observed.get("if_in_stock_action")),
+            clean_text(observed.get("audit_action")),
+        )
+        if baseline_outcome != observed_outcome:
+            failures.append(
+                {
+                    "pair_id": row.pair.pair_id,
+                    "source_group": row.pair.source_group,
+                    "baseline": baseline_outcome,
+                    "mutated": observed_outcome,
+                }
+            )
+    return {
+        "tests": len(rows),
+        "failure_count": len(failures),
+        "failures": failures[:100],
+        "mutated_fields": [
+            "Case#",
+            "Date Created",
+            "neutral Reason for request suffix",
+            "row order / source row number",
+        ],
+        "row_order_invariant": not failures,
+    }
+
+
+def distillery_boundary_tests(
+    rules: Sequence[DistilleryRule],
+    profile: Mapping[str, Any],
+) -> dict[str, Any]:
+    documented = (
+        (profile.get("induction") or {}).get(
+            "documented_numeric_thresholds"
+        )
+        or {}
+    )
+    observed: dict[str, set[float]] = defaultdict(set)
+    unsupported: list[dict[str, Any]] = []
+    for rule in rules:
+        for atom in rule.predicates:
+            if atom.operator not in NUMERIC_OPERATORS:
+                continue
+            number = distillery_number(atom.value)
+            if number is None:
+                unsupported.append(
+                    {
+                        "rule_id": rule.rule_id,
+                        "field": atom.field,
+                        "operator": atom.operator,
+                        "value": _plain_data(atom.value),
+                    }
+                )
+                continue
+            observed[atom.field].add(float(number))
+            allowed = [
+                float(value)
+                for value in documented.get(atom.field, [])
+            ]
+            if not any(math.isclose(number, value) for value in allowed):
+                unsupported.append(
+                    {
+                        "rule_id": rule.rule_id,
+                        "field": atom.field,
+                        "operator": atom.operator,
+                        "value": number,
+                    }
+                )
+    cases = [
+        {
+            "field": field_name,
+            "threshold": float(threshold),
+            "below": float(threshold) - 1e-9,
+            "at": float(threshold),
+            "above": float(threshold) + 1e-9,
+            "observed_in_candidate": any(
+                math.isclose(float(threshold), value)
+                for value in observed.get(field_name, set())
+            ),
+        }
+        for field_name, thresholds in documented.items()
+        for threshold in thresholds
+    ]
+    return {
+        "cases": cases,
+        "unsupported_count": len(unsupported),
+        "unsupported": unsupported,
+        "passed": not unsupported,
+    }
+
+
 def run_rules_distillery(
     *,
     profile_id: str,
@@ -6088,8 +8068,16 @@ def run_rules_distillery(
     outcome_aliases: Mapping[str, Mapping[str, Any]] | None = None,
     approved_alias_keys: Sequence[str] | None = None,
     approved_rule_signatures: Sequence[str] | None = None,
+    policy_sources: Sequence[Mapping[str, Any]] | None = None,
+    reference_sources: Sequence[Mapping[str, Any]] | None = None,
+    reference_object_mappings: Mapping[str, str] | None = None,
+    mutation_classifications: Mapping[str, str] | None = None,
+    approved_reference_contracts: Sequence[str] | None = None,
+    approved_ambiguous_pair_ids: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     profile = distillery_profile(profile_id)
+    policy_pack = distillery_policy_pack(policy_sources, profile)
+    reference_pack = distillery_reference_datasets(reference_sources)
     before_documents = distillery_documents_from_upload(
         before_file_name,
         before_bytes,
@@ -6113,14 +8101,50 @@ def run_rules_distillery(
         outcome_aliases,
     )
     projected = distillery_project_pairs(pairs, profile)
-    mined = LiteralFilterMiner(profile).fit(projected)
+    reference_fields = [
+        f"ref_{distillery_field(contract)}"
+        for contract in (reference_pack.get("datasets") or {})
+    ]
+    if reference_fields:
+        induction = profile.setdefault("induction", {})
+        induction["governed_fields"] = list(
+            dict.fromkeys(
+                [
+                    *(induction.get("governed_fields") or []),
+                    *reference_fields,
+                ]
+            )
+        )
+        for stage in profile.get("policy_stages") or []:
+            if int(stage.get("stage") or 0) in {3, 4, 5}:
+                stage["fields"] = list(
+                    dict.fromkeys(
+                        [
+                            *(stage.get("fields") or []),
+                            *reference_fields,
+                        ]
+                    )
+                )
+    projected, enrichment_report = distillery_enrich_projected_rows(
+        projected,
+        reference_pack,
+    )
+    mutation_inventory = distillery_mutation_inventory(
+        pairs,
+        profile,
+        mutation_classifications,
+    )
+    mined = PolicyGroundedFilterMiner(
+        profile,
+        policy_pack,
+    ).fit(projected)
     rules = mined["rules"]
     governed = (
         (profile.get("induction") or {}).get("governed_fields") or []
     )
     validation = distillery_validate(projected, rules, governed)
     holdout = (
-        literal_distillery_holdouts(projected, profile)
+        policy_grounded_holdouts(projected, profile, policy_pack)
         if run_holdouts
         else {
             "strategy": "not-run",
@@ -6128,6 +8152,7 @@ def run_rules_distillery(
             "mean_accuracy": 0.0,
             "minimum_accuracy": 0.0,
             "maximum_accuracy": 0.0,
+            "completed": False,
         }
     )
     approvals = {
@@ -6160,16 +8185,128 @@ def run_rules_distillery(
         ).lower()
         not in approvals
     ]
+    pending_amendments = [
+        {
+            "logic_signature": literal_logic_signature(
+                rule.predicates,
+                rule.outputs,
+            ),
+            "rule_id": rule.rule_id,
+            "name": literal_filter_name(
+                profile_id,
+                rule.predicates,
+                rule.outputs,
+            ),
+            "policy_stage": rule.policy_stage,
+            "policy_stage_code": rule.policy_stage_code,
+            "rationale": rule.rationale,
+            "support_rows": rule.support,
+            "source_groups": list(rule.source_groups),
+        }
+        for rule in rules
+        if clean_text(rule.amendment_status) == "draft_amendment"
+        and not approve_all_rules
+        and literal_logic_signature(
+            rule.predicates,
+            rule.outputs,
+        ).lower()
+        not in approvals
+    ]
+    reference_approvals = {
+        clean_text(value)
+        for value in (approved_reference_contracts or [])
+        if clean_text(value)
+    }
+    approve_all_references = "*" in reference_approvals
+    uploaded_contracts = set(
+        (reference_pack.get("datasets") or {}).keys()
+    )
+    object_mappings = {
+        clean_text(contract): clean_text(object_name)
+        for contract, object_name in (
+            reference_object_mappings or {}
+        ).items()
+        if clean_text(contract) and clean_text(object_name)
+    }
+    mapped_contracts = uploaded_contracts | set(object_mappings)
+    required_contracts = {
+        clean_text(value)
+        for value in profile.get("reference_contracts") or []
+        if clean_text(value)
+    }
+    missing_reference_contracts = sorted(
+        required_contracts - mapped_contracts
+    )
+    reference_row_proposals = distillery_reference_row_proposals(
+        pairs,
+        missing_reference_contracts,
+    )
+    pending_reference_contracts = sorted(
+        contract
+        for contract in mapped_contracts
+        if not approve_all_references
+        and contract not in reference_approvals
+    )
     gaps = list(mined["gaps"])
     conflicts = list(mined["conflicts"])
+    approved_ambiguous = {
+        clean_text(value)
+        for value in (approved_ambiguous_pair_ids or [])
+        if clean_text(value)
+    }
+    ambiguous_records = [
+        {
+            "pair_id": pair.pair_id,
+            "source_group": pair.source_group,
+            "before_index": pair.before_index,
+            "after_index": pair.after_index,
+            "similarity_score": round(float(pair.score), 6),
+            "business": clean_text(pair.before.get("Business")),
+            "request_type": clean_text(pair.before.get("Type")),
+            "case": clean_text(pair.before.get("Case#")),
+            "din": clean_text(pair.before.get("DIN")),
+            "min": clean_text(pair.before.get("MIN")),
+            "before_description": clean_text(
+                pair.before.get("Description")
+            ),
+            "after_description": clean_text(
+                pair.after.get("Description")
+            ),
+            "status": (
+                "approved"
+                if pair.pair_id in approved_ambiguous
+                else "review_required"
+            ),
+        }
+        for pair in pairs
+        if pair.ambiguous
+    ]
+    ambiguous_pairs = [
+        clean_text(item.get("pair_id"))
+        for item in ambiguous_records
+        if clean_text(item.get("status")) != "approved"
+    ]
+    metamorphic = distillery_metamorphic_tests(projected, rules)
+    boundary_tests = distillery_boundary_tests(rules, profile)
     deployment_eligible = (
         validation["accuracy"] == 1.0
         and validation["contradictions"] == 0
         and not unmatched
+        and not ambiguous_pairs
         and not gaps
         and not conflicts
         and not pending_one_date
+        and not pending_amendments
+        and not missing_reference_contracts
+        and not pending_reference_contracts
+        and int(enrichment_report.get("contradiction_count") or 0) == 0
+        and int(mutation_inventory.get("unresolved_count") or 0) == 0
         and int(alias_registry.get("review_required") or 0) == 0
+        and bool(policy_pack.get("ready"))
+        and bool(holdout.get("completed"))
+        and float(holdout.get("minimum_accuracy") or 0.0) == 1.0
+        and int(metamorphic.get("failure_count") or 0) == 0
+        and int(boundary_tests.get("unsupported_count") or 0) == 0
     )
     before_hash = hashlib.sha256(before_bytes).hexdigest()
     after_hash = hashlib.sha256(after_bytes).hexdigest()
@@ -6189,6 +8326,32 @@ def run_rules_distillery(
                 after_hash,
                 alias_hash,
                 approval_hash,
+                clean_text(policy_pack.get("sha256")),
+                hashlib.sha256(
+                    json.dumps(
+                        _plain_data(reference_pack),
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest(),
+                hashlib.sha256(
+                    json.dumps(
+                        _plain_data(object_mappings),
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ).encode("utf-8")
+                ).hexdigest(),
+                hashlib.sha256(
+                    json.dumps(
+                        _plain_data(mutation_classifications or {}),
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ).encode("utf-8")
+                ).hexdigest(),
+                hashlib.sha256(
+                    "|".join(sorted(approved_ambiguous)).encode("utf-8")
+                ).hexdigest(),
                 "holdouts" if run_holdouts else "draft",
             ]
         ).encode("utf-8")
@@ -6245,6 +8408,148 @@ def run_rules_distillery(
             "unique": len(canonical_counts),
             "counts": dict(canonical_counts.most_common()),
         }
+    amendment_catalog = literal_distillery_catalog(
+        rules,
+        profile,
+        run_id,
+        float(holdout.get("mean_accuracy") or 0.0),
+        approved_rule_signatures,
+    )
+    scaffold_catalog = policy_scaffold_catalog(policy_pack, profile)
+    catalog = [*amendment_catalog, *scaffold_catalog]
+    scaffold_validation = distillery_validate_catalog(
+        projected,
+        scaffold_catalog,
+    )
+    feature_contradictions = int(validation.get("contradictions") or 0)
+    validation = distillery_validate_catalog(projected, catalog)
+    validation["contradictions"] = feature_contradictions
+    projected_by_id = {
+        row.pair.pair_id: row for row in projected
+    }
+    gaps = [
+        {
+            "gap_id": hashlib.sha256(
+                f"{item.get('pair_id')}|candidate-gap".encode("utf-8")
+            ).hexdigest()[:24],
+            "gap_type": "candidate_terminal_mismatch",
+            "pair_id": clean_text(item.get("pair_id")),
+            "source_group": clean_text(item.get("source_group")),
+            "expected_outcome": _plain_data(
+                item.get("expected_outcome") or {}
+            ),
+            "observed_outcome": _plain_data(
+                item.get("observed_outcome") or {}
+            ),
+            "terminal_trace": _plain_data(
+                item.get("terminal_trace") or []
+            ),
+            "reason": (
+                "The complete policy scaffold plus approved Distillery "
+                "amendments did not reproduce the atomic AFTER outcome."
+            ),
+            "evidence": {
+                "business": clean_text(
+                    projected_by_id.get(
+                        clean_text(item.get("pair_id"))
+                    ).pair.before.get("Business")
+                )
+                if projected_by_id.get(clean_text(item.get("pair_id")))
+                else "",
+                "type": clean_text(
+                    projected_by_id.get(
+                        clean_text(item.get("pair_id"))
+                    ).pair.before.get("Type")
+                )
+                if projected_by_id.get(clean_text(item.get("pair_id")))
+                else "",
+            },
+        }
+        for item in validation.get("terminal_path_failures") or []
+    ]
+    validation["terminal_path_failure_count"] = len(gaps)
+    validation.pop("terminal_path_failures", None)
+    gap_cluster_values: dict[str, dict[str, Any]] = {}
+    for gap in gaps:
+        evidence = gap.get("evidence") or {}
+        cluster_payload = {
+            "expected_outcome": gap.get("expected_outcome") or {},
+            "observed_outcome": gap.get("observed_outcome") or {},
+            "business": clean_text(evidence.get("business")),
+            "request_type": clean_text(evidence.get("type")),
+        }
+        signature = hashlib.sha256(
+            json.dumps(
+                _plain_data(cluster_payload),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        cluster = gap_cluster_values.setdefault(
+            signature,
+            {
+                "cluster_signature": signature,
+                **cluster_payload,
+                "row_count": 0,
+                "supporting_dates": set(),
+                "example_pair_ids": [],
+                "next_action": (
+                    "Map missing governed reference context or approve a "
+                    "source-backed semantic amendment."
+                ),
+            },
+        )
+        cluster["row_count"] += 1
+        cluster["supporting_dates"].add(
+            clean_text(gap.get("source_group"))
+        )
+        if len(cluster["example_pair_ids"]) < 10:
+            cluster["example_pair_ids"].append(
+                clean_text(gap.get("pair_id"))
+            )
+    gap_clusters = [
+        {
+            **cluster,
+            "supporting_dates": sorted(cluster["supporting_dates"]),
+        }
+        for cluster in sorted(
+            gap_cluster_values.values(),
+            key=lambda item: (
+                -int(item.get("row_count") or 0),
+                clean_text(item.get("cluster_signature")),
+            ),
+        )
+    ]
+    predicate_violations = distillery_catalog_predicate_violations(
+        catalog,
+        profile,
+    )
+    metamorphic = distillery_catalog_metamorphic_tests(
+        projected,
+        catalog,
+    )
+    deployment_eligible = (
+        validation["accuracy"] == 1.0
+        and validation["contradictions"] == 0
+        and not unmatched
+        and not ambiguous_pairs
+        and not gaps
+        and not conflicts
+        and not pending_one_date
+        and not pending_amendments
+        and not missing_reference_contracts
+        and not pending_reference_contracts
+        and int(enrichment_report.get("contradiction_count") or 0) == 0
+        and int(mutation_inventory.get("unresolved_count") or 0) == 0
+        and int(alias_registry.get("review_required") or 0) == 0
+        and bool(policy_pack.get("ready"))
+        and bool(holdout.get("completed"))
+        and float(holdout.get("minimum_accuracy") or 0.0) == 1.0
+        and int(metamorphic.get("failure_count") or 0) == 0
+        and int(boundary_tests.get("unsupported_count") or 0) == 0
+        and not predicate_violations
+    )
     report = {
         "run_id": run_id,
         "profile_id": profile_id,
@@ -6277,7 +8582,22 @@ def run_rules_distillery(
             "ambiguous": sum(pair.ambiguous for pair in pairs),
             "methods": dict(methods),
             "changed_input_fields": dict(changed_fields.most_common()),
+            "unresolved_ambiguous_pair_ids": ambiguous_pairs,
+            "ambiguous_match_records": ambiguous_records,
         },
+        "policy_pack": policy_pack,
+        "reference_contracts": {
+            "required": sorted(required_contracts),
+            "uploaded": sorted(uploaded_contracts),
+            "snowflake_object_mappings": object_mappings,
+            "missing": missing_reference_contracts,
+            "pending_approval": pending_reference_contracts,
+            "datasets": reference_pack.get("datasets") or {},
+            "errors": reference_pack.get("errors") or [],
+            "enrichment": enrichment_report,
+            "candidate_rows": reference_row_proposals,
+        },
+        "mutation_inventory": mutation_inventory,
         "labels": {
             "unique": len(labels),
             "counts": dict(labels.most_common()),
@@ -6294,22 +8614,64 @@ def run_rules_distillery(
             "permutations_by_date": mined["permutations"],
         },
         "rules": {
-            "total": len(rules),
+            "total": len(catalog),
+            "distilled_total": len(rules),
+            "policy_scaffold_definitions": len(scaffold_catalog),
+            "policy_scaffold_executable_variants": len(
+                executable_variants(scaffold_catalog)
+            ),
+            "policy_scaffold_exact_rows": int(
+                scaffold_validation.get("exact_count") or 0
+            ),
             "reusable": sum(rule.kind == "reusable" for rule in rules),
             "one_date": sum(rule.kind == "one_date" for rule in rules),
-            "pending_approval": len(pending_one_date),
+            "pending_approval": (
+                len(pending_one_date) + len(pending_amendments)
+            ),
+            "source_backed": sum(
+                clean_text(rule.amendment_status) == "source_backed"
+                for rule in rules
+            ),
+            "draft_amendments": sum(
+                clean_text(rule.amendment_status) == "draft_amendment"
+                for rule in rules
+            ),
             "reusable_support": sum(
                 rule.support for rule in rules if rule.kind == "reusable"
             ),
             "one_date_support": sum(
                 rule.support for rule in rules if rule.kind == "one_date"
             ),
-            "forbidden_runtime_predicates": 0,
+            "forbidden_runtime_predicates": len(predicate_violations),
         },
         "pending_rule_approvals": pending_one_date,
+        "pending_amendments": pending_amendments,
+        "predicate_violations": predicate_violations,
+        "convergence": [
+            {
+                "stage": 0,
+                "stage_code": "known_policy_scaffold",
+                "stage_name": (
+                    "Known matrix anchors (partial, not a completeness claim)"
+                ),
+                "input_residual_rows": len(projected),
+                "rules_added": len(scaffold_catalog),
+                "exact_rows_added": int(
+                    scaffold_validation.get("exact_count") or 0
+                ),
+                "residual_rows": (
+                    len(projected)
+                    - int(scaffold_validation.get("exact_count") or 0)
+                ),
+                "conflicts": 0,
+            },
+            *(mined.get("convergence") or []),
+        ],
         "gaps": {
             "count": len(gaps),
             "records": gaps,
+            "cluster_count": len(gap_clusters),
+            "clusters": gap_clusters,
         },
         "conflicts": {
             "count": len(conflicts),
@@ -6317,39 +8679,90 @@ def run_rules_distillery(
         },
         "validation": validation,
         "holdout": holdout,
+        "tests": {
+            "boundary": boundary_tests,
+            "metamorphic": metamorphic,
+            "terminal_path": {
+                "required_paths_per_row": 1,
+                "failure_count": (
+                    len(validation.get("uncovered_pair_ids") or [])
+                    + len(validation.get("mismatched_pair_ids") or [])
+                ),
+            },
+            "candidate_isolation": {
+                "mutates_active_catalog": False,
+                "mutates_workflow_rows": False,
+            },
+        },
         "deployment_gate": {
             "eligible": deployment_eligible,
             "requirements": {
                 "corpus_accuracy": 1.0,
                 "unmatched_rows": 0,
+                "unresolved_ambiguous_matches": 0,
                 "contradictions": 0,
                 "gaps": 0,
                 "filter_conflicts": 0,
                 "pending_rule_approvals": 0,
+                "pending_amendments": 0,
                 "pending_alias_reviews": 0,
+                "pending_reference_contracts": 0,
+                "missing_reference_contracts": 0,
+                "reference_contradictions": 0,
+                "unresolved_mutation_classifications": 0,
+                "policy_pack_errors_or_missing": 0,
+                "holdout_incomplete": 0,
+                "minimum_holdout_accuracy": 1.0,
+                "metamorphic_failures": 0,
+                "unsupported_boundary_predicates": 0,
                 "forbidden_runtime_predicates": 0,
             },
             "observed": {
                 "corpus_accuracy": validation["accuracy"],
                 "unmatched_rows": len(unmatched),
+                "unresolved_ambiguous_matches": len(ambiguous_pairs),
                 "contradictions": validation["contradictions"],
                 "gaps": len(gaps),
                 "filter_conflicts": len(conflicts),
                 "pending_rule_approvals": len(pending_one_date),
+                "pending_amendments": len(pending_amendments),
                 "pending_alias_reviews": int(
                     alias_registry.get("review_required") or 0
                 ),
-                "forbidden_runtime_predicates": 0,
+                "pending_reference_contracts": len(
+                    pending_reference_contracts
+                ),
+                "missing_reference_contracts": len(
+                    missing_reference_contracts
+                ),
+                "reference_contradictions": int(
+                    enrichment_report.get("contradiction_count") or 0
+                ),
+                "unresolved_mutation_classifications": int(
+                    mutation_inventory.get("unresolved_count") or 0
+                ),
+                "policy_pack_errors_or_missing": (
+                    0 if policy_pack.get("ready") else 1
+                ),
+                "holdout_incomplete": (
+                    0 if holdout.get("completed") else 1
+                ),
+                "minimum_holdout_accuracy": float(
+                    holdout.get("minimum_accuracy") or 0.0
+                ),
+                "metamorphic_failures": int(
+                    metamorphic.get("failure_count") or 0
+                ),
+                "unsupported_boundary_predicates": int(
+                    boundary_tests.get("unsupported_count") or 0
+                ),
+                "forbidden_runtime_predicates": len(
+                    predicate_violations
+                ),
             },
         },
     }
-    catalog = literal_distillery_catalog(
-        rules,
-        profile,
-        run_id,
-        float(holdout.get("mean_accuracy") or 0.0),
-        approved_rule_signatures,
-    )
+    report["deployment_gate"]["eligible"] = deployment_eligible
     return {
         "run_id": run_id,
         "profile_id": profile_id,
@@ -6358,6 +8771,9 @@ def run_rules_distillery(
         "gaps": gaps,
         "conflicts": conflicts,
         "alias_registry": alias_registry,
+        "policy_pack": policy_pack,
+        "reference_pack": reference_pack,
+        "mutation_inventory": mutation_inventory,
         "deployment_eligible": deployment_eligible,
     }
 
@@ -7329,6 +9745,53 @@ class SnowflakeRulesStore:
         }
         return parsed, source_hash, metadata
 
+    def snapshot_reference_object(
+        self,
+        contract: str,
+        object_name: str,
+    ) -> dict[str, Any]:
+        """Read a governed Snowflake table/view into a deterministic snapshot."""
+        contract_name = clean_text(contract)
+        source_name = clean_text(object_name)
+        if not contract_name or not source_name:
+            raise ValueError(
+                "Reference contract and Snowflake object name are required."
+            )
+        identifier = re.compile(
+            r"^[A-Za-z_][A-Za-z0-9_$]*(?:\.[A-Za-z_][A-Za-z0-9_$]*){0,2}$"
+        )
+        if not identifier.fullmatch(source_name):
+            raise ValueError(
+                f"Unsafe Snowflake object identifier {source_name!r}."
+            )
+        source_rows = self.collect(f"SELECT * FROM {source_name}")
+        records = [
+            _plain_data(snowflake_source_row_dict(row))
+            for row in source_rows
+        ]
+        serialized = sorted(
+            json.dumps(
+                record,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=json_default,
+            )
+            for record in records
+        )
+        content = (
+            "[" + ",".join(serialized) + "]"
+        ).encode("utf-8")
+        return {
+            "name": f"{contract_name}.json",
+            "contract": contract_name,
+            "source_kind": "snowflake_object_snapshot",
+            "source_name": source_name,
+            "data": content,
+            "sha256": hashlib.sha256(content).hexdigest(),
+            "row_count": len(records),
+        }
+
     def collect(self, query: str, params: Sequence[Any] | None = None) -> list[Any]:
         if params is None:
             return list(self.session.sql(query).collect())
@@ -7370,6 +9833,25 @@ class SnowflakeRulesStore:
                 self.collect(f"SELECT 1 AS READY FROM {table_name} LIMIT 0")
             except Exception as exc:
                 failures.append(f"{key}: {table_name} ({clean_text(exc)})")
+        column_contracts = {
+            "references": (
+                "WORKFLOW_ID, DATASET_NAME, DATASET_VERSION_ID, VALUE_TYPE, "
+                "VALUE_JSON, KEY_JSON, SOURCE_KIND, SOURCE_NAME, "
+                "SOURCE_SHA256, STATUS, EFFECTIVE_FROM, EFFECTIVE_TO, "
+                "APPROVED_BY, APPROVED_AT, METADATA"
+            ),
+            "rows": "AUDIT_ACTION",
+        }
+        for key, columns in column_contracts.items():
+            try:
+                self.collect(
+                    f"SELECT {columns} FROM {self.table(key)} LIMIT 0"
+                )
+            except Exception as exc:
+                failures.append(
+                    f"{key} column contract: {self.table(key)} "
+                    f"({clean_text(exc)})"
+                )
         if failures:
             detail = "\n".join(f"- {failure}" for failure in failures)
             raise RuntimeError(
@@ -7803,6 +10285,159 @@ class SnowflakeRulesStore:
                 output.append(rule)
         return output
 
+    def persist_reference_dataset_versions(
+        self,
+        version_id: str,
+        workflow_id: str,
+        reference_contracts: Mapping[str, Any] | None,
+    ) -> int:
+        contract_report = dict(reference_contracts or {})
+        pending = {
+            clean_text(value)
+            for value in contract_report.get("pending_approval") or []
+        }
+        timestamp = iso_now()
+        user = self.current_user()
+        values: list[dict[str, Any]] = []
+        seen_reference_values: set[tuple[str, str]] = set()
+        for contract, dataset in (
+            contract_report.get("datasets") or {}
+        ).items():
+            if not isinstance(dataset, Mapping):
+                continue
+            rows = dataset.get("rows") or []
+            row_hashes = dataset.get("row_hashes") or []
+            for index, row in enumerate(rows):
+                row_hash = (
+                    clean_text(row_hashes[index])
+                    if index < len(row_hashes)
+                    else hashlib.sha256(
+                        json.dumps(
+                            _plain_data(row),
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    ).hexdigest()
+                )
+                list_name = f"{workflow_id}:{contract}:{version_id}"
+                uniqueness = (list_name, row_hash)
+                if uniqueness in seen_reference_values:
+                    continue
+                seen_reference_values.add(uniqueness)
+                values.append(
+                    {
+                        "list_name": list_name,
+                        "value": row_hash,
+                        "workflow_id": workflow_id,
+                        "dataset_name": clean_text(contract),
+                        "dataset_version_id": version_id,
+                        "value_type": "record",
+                        "value_json": _plain_data(row),
+                        "key_json": {"row_hash": row_hash},
+                        "source_kind": clean_text(
+                            dataset.get("source_kind")
+                        )
+                        or "upload",
+                        "source_name": clean_text(
+                            dataset.get("source_name")
+                        ),
+                        "source_sha256": clean_text(
+                            dataset.get("source_sha256")
+                        ),
+                        "status": (
+                            "PENDING_APPROVAL"
+                            if clean_text(contract) in pending
+                            else "APPROVED"
+                        ),
+                        "approved_by": (
+                            "" if clean_text(contract) in pending else user
+                        ),
+                        "approved_at": (
+                            "" if clean_text(contract) in pending else timestamp
+                        ),
+                        "metadata": {
+                            "catalog_version_id": version_id,
+                            "columns": dataset.get("columns") or [],
+                            "row_count": int(
+                                dataset.get("row_count") or len(rows)
+                            ),
+                        },
+                    }
+                )
+        for contract, object_name in (
+            contract_report.get("snowflake_object_mappings") or {}
+        ).items():
+            mapping_hash = hashlib.sha256(
+                clean_text(object_name).encode("utf-8")
+            ).hexdigest()
+            values.append(
+                {
+                    "list_name": f"{workflow_id}:{contract}:{version_id}",
+                    "value": f"object:{mapping_hash}",
+                    "workflow_id": workflow_id,
+                    "dataset_name": clean_text(contract),
+                    "dataset_version_id": version_id,
+                    "value_type": "snowflake_object_mapping",
+                    "value_json": {"object_name": clean_text(object_name)},
+                    "key_json": {"mapping_hash": mapping_hash},
+                    "source_kind": "snowflake_object",
+                    "source_name": clean_text(object_name),
+                    "source_sha256": mapping_hash,
+                    "status": (
+                        "PENDING_APPROVAL"
+                        if clean_text(contract) in pending
+                        else "APPROVED"
+                    ),
+                    "approved_by": (
+                        "" if clean_text(contract) in pending else user
+                    ),
+                    "approved_at": (
+                        "" if clean_text(contract) in pending else timestamp
+                    ),
+                    "metadata": {"catalog_version_id": version_id},
+                }
+            )
+        for batch in chunked(values):
+            self.execute(
+                f"""
+                    INSERT INTO {self.table('references')} (
+                        LIST_NAME, VALUE, ACTIVE, NOTES, UPDATED_AT,
+                        WORKFLOW_ID, DATASET_NAME, DATASET_VERSION_ID,
+                        VALUE_TYPE, VALUE_JSON, KEY_JSON,
+                        SOURCE_KIND, SOURCE_NAME, SOURCE_SHA256, STATUS,
+                        EFFECTIVE_FROM, EFFECTIVE_TO,
+                        APPROVED_BY, APPROVED_AT, METADATA
+                    )
+                    SELECT
+                        value:"list_name"::VARCHAR,
+                        value:"value"::VARCHAR,
+                        FALSE,
+                        'Versioned Distillery reference dataset',
+                        CURRENT_TIMESTAMP(),
+                        value:"workflow_id"::VARCHAR,
+                        value:"dataset_name"::VARCHAR,
+                        value:"dataset_version_id"::VARCHAR,
+                        value:"value_type"::VARCHAR,
+                        value:"value_json",
+                        value:"key_json",
+                        value:"source_kind"::VARCHAR,
+                        value:"source_name"::VARCHAR,
+                        value:"source_sha256"::VARCHAR,
+                        value:"status"::VARCHAR,
+                        CURRENT_TIMESTAMP(),
+                        NULL,
+                        NULLIF(value:"approved_by"::VARCHAR, ''),
+                        TRY_TO_TIMESTAMP_TZ(
+                            NULLIF(value:"approved_at"::VARCHAR, '')
+                        ),
+                        value:"metadata"
+                    FROM TABLE(FLATTEN(INPUT => PARSE_JSON(?)))
+                """,
+                [json_dumps(batch)],
+            )
+        return len(values)
+
     def save_catalog_candidate(
         self,
         catalog: Sequence[Mapping[str, Any]],
@@ -7858,6 +10493,23 @@ class SnowflakeRulesStore:
             )
         )
         timestamp = iso_now()
+        persisted_report = deepcopy(dict(report))
+        persisted_gaps = persisted_report.get("gaps")
+        if isinstance(persisted_gaps, MutableMapping):
+            persisted_gaps.pop("records", None)
+        persisted_conflicts = persisted_report.get("conflicts")
+        if isinstance(persisted_conflicts, MutableMapping):
+            persisted_conflicts.pop("records", None)
+        persisted_references = persisted_report.get(
+            "reference_contracts"
+        )
+        if isinstance(persisted_references, MutableMapping):
+            for dataset in (
+                persisted_references.get("datasets") or {}
+            ).values():
+                if isinstance(dataset, MutableMapping):
+                    dataset.pop("rows", None)
+                    dataset.pop("row_hashes", None)
         version = {
             "id": version_id,
             "workflow_id": workflow_id,
@@ -7872,7 +10524,7 @@ class SnowflakeRulesStore:
             "deployment_eligible": bool_value(
                 (report.get("deployment_gate") or {}).get("eligible")
             ),
-            "report": _plain_data(report),
+            "report": _plain_data(persisted_report),
             "created_by": self.current_user(),
             "created_at": timestamp,
             "activated_by": "",
@@ -7923,6 +10575,13 @@ class SnowflakeRulesStore:
                 workflow_id,
                 catalog,
             )
+            reference_row_count = self.persist_reference_dataset_versions(
+                version_id,
+                workflow_id,
+                report.get("reference_contracts")
+                if isinstance(report, Mapping)
+                else {},
+            )
             if gap_values:
                 self.execute(
                     f"""
@@ -7955,6 +10614,7 @@ class SnowflakeRulesStore:
                     "workflow_id": workflow_id,
                     "rule_count": len(catalog),
                     "gap_count": len(gap_values),
+                    "reference_row_count": reference_row_count,
                 },
             )
         return version
@@ -8062,7 +10722,7 @@ class SnowflakeRulesStore:
             target.get("deployment_eligible")
         ):
             raise ValueError(
-                "The candidate has not passed the literal-filter deployment gate."
+                "The candidate has not passed the policy-grounded deployment gate."
             )
         if status not in {"CANDIDATE", "RETIRED", "ACTIVE"}:
             raise ValueError(f"Catalog version status {status!r} cannot be activated.")
@@ -8127,6 +10787,45 @@ class SnowflakeRulesStore:
                     WHERE ID = ?
                 """,
                 [user, timestamp, timestamp, version_id],
+            )
+            self.execute(
+                f"""
+                    UPDATE {self.table('references')}
+                    SET
+                        ACTIVE = FALSE,
+                        STATUS = 'RETIRED',
+                        EFFECTIVE_TO = TRY_TO_TIMESTAMP_TZ(?),
+                        UPDATED_AT = TRY_TO_TIMESTAMP_TZ(?)
+                    WHERE WORKFLOW_ID = ?
+                      AND DATASET_VERSION_ID <> ?
+                      AND STATUS = 'ACTIVE'
+                """,
+                [
+                    timestamp,
+                    timestamp,
+                    workflow_id,
+                    version_id,
+                ],
+            )
+            self.execute(
+                f"""
+                    UPDATE {self.table('references')}
+                    SET
+                        ACTIVE = TRUE,
+                        STATUS = 'ACTIVE',
+                        EFFECTIVE_FROM = TRY_TO_TIMESTAMP_TZ(?),
+                        EFFECTIVE_TO = NULL,
+                        UPDATED_AT = TRY_TO_TIMESTAMP_TZ(?)
+                    WHERE WORKFLOW_ID = ?
+                      AND DATASET_VERSION_ID = ?
+                      AND STATUS IN ('APPROVED', 'ACTIVE', 'RETIRED')
+                """,
+                [
+                    timestamp,
+                    timestamp,
+                    workflow_id,
+                    version_id,
+                ],
             )
             self.log_event(
                 entity_type="catalog_version",
@@ -8349,20 +11048,50 @@ class SnowflakeRulesStore:
                 inserted += len(values)
         return inserted
 
-    def load_reference_lists(self, include_defaults: bool = True) -> dict[str, list[str]]:
+    def load_reference_lists(
+        self,
+        include_defaults: bool = True,
+        dataset_version_id: str = "",
+    ) -> dict[str, Any]:
+        selected_version = clean_text(dataset_version_id)
+        where_clause = (
+            """
+            (
+                (DATASET_VERSION_ID IS NULL AND COALESCE(ACTIVE, TRUE) = TRUE)
+                OR DATASET_VERSION_ID = ?
+            )
+            """
+            if selected_version
+            else "COALESCE(ACTIVE, TRUE) = TRUE"
+        )
         query = f"""
-            SELECT LIST_NAME, VALUE
+            SELECT
+                LIST_NAME,
+                VALUE,
+                DATASET_NAME,
+                TO_JSON(VALUE_JSON) AS VALUE_JSON
             FROM {self.table('references')}
-            WHERE COALESCE(ACTIVE, TRUE) = TRUE
+            WHERE {where_clause}
             ORDER BY LIST_NAME, VALUE
         """
-        output: dict[str, list[str]] = {}
-        for source_row in self.collect(query):
+        params: list[Any] = [selected_version] if selected_version else []
+        output: dict[str, Any] = {}
+        typed: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for source_row in self.collect(query, params or None):
             data = snowflake_row_dict(source_row)
             name = clean_text(data.get("list_name"))
             value = clean_text(data.get("value"))
-            if name and value:
+            dataset_name = clean_text(data.get("dataset_name"))
+            value_json = normalize_persisted_json(
+                data.get("value_json"),
+                None,
+            )
+            if dataset_name and isinstance(value_json, Mapping):
+                typed[dataset_name].append(dict(value_json))
+            elif name and value:
                 output.setdefault(name, []).append(value)
+        if typed:
+            output["__typed_datasets__"] = dict(typed)
         if include_defaults:
             for name, values in DEFAULT_REFERENCE_LISTS.items():
                 output.setdefault(name, list(values))
@@ -9146,6 +11875,13 @@ def compare_catalog_version(
         if rule_workflow_id(rule) == workflow_id
     ]
     references = store.load_reference_lists()
+    try:
+        candidate_references = store.load_reference_lists(
+            dataset_version_id=version_id,
+        )
+    except TypeError:
+        # Backward-compatible for test doubles and pre-migration stores.
+        candidate_references = references
     active_rows, _, _ = execute_rows(
         source_rows,
         active_rules,
@@ -9154,7 +11890,7 @@ def compare_catalog_version(
     candidate_rows, _, _ = execute_rows(
         source_rows,
         candidate_catalog_for_test(candidate_rules),
-        reference_lists=references,
+        reference_lists=candidate_references,
     )
     records: list[dict[str, Any]] = []
     same_count = 0
@@ -11951,8 +14687,8 @@ def render_rules_distillery_page(store: SnowflakeRulesStore) -> None:
     render_page_header(
         "Rules Distillery",
         (
-            "Reconstruct literal business filters from every matching dated "
-            "BEFORE/AFTER pair, then test an immutable candidate before activation."
+            "Compile known policy anchors and reverse-engineer every residual "
+            "BEFORE/AFTER behavior into a governed, testable candidate."
         ),
         kicker="Mechanized Rule Discovery",
     )
@@ -11970,15 +14706,11 @@ def render_rules_distillery_page(store: SnowflakeRulesStore) -> None:
         ),
         key="literal_distillery_profile",
     )
-    run_holdouts = controls[1].checkbox(
-        "Leave-one-date-out validation",
-        value=False,
-        key="literal_distillery_holdouts",
-        help=(
-            "Optional and compute-intensive: retrains reusable filters ten "
-            "times, each with one date withheld from discovery."
-        ),
+    controls[1].success(
+        "Mandatory holdout · ON",
+        icon=":material/verified:",
     )
+    run_holdouts = True
     try:
         persisted_aliases = store.load_outcome_aliases(profile_id)
     except Exception as exc:
@@ -11999,6 +14731,97 @@ def render_rules_distillery_page(store: SnowflakeRulesStore) -> None:
         for value in st.session_state.get(approval_key, [])
         if clean_text(value)
     ]
+    ambiguity_approval_key = (
+        f"_approved_ambiguous_pairs_{profile_id}"
+    )
+    approved_ambiguous_pair_ids = [
+        clean_text(value)
+        for value in st.session_state.get(ambiguity_approval_key, [])
+        if clean_text(value)
+    ]
+    st.markdown("### Workflow policy pack")
+    st.caption(
+        "Upload the standardized logic matrix and its process documents. "
+        "Their normalized content, hashes, clauses, and citations are stored "
+        "inside the immutable candidate version—not in the repository."
+    )
+    policy_uploads = st.file_uploader(
+        "Policy sources",
+        type=sorted(POLICY_SOURCE_EXTENSIONS),
+        accept_multiple_files=True,
+        key="policy_grounded_sources",
+        help=(
+            "For Product Request, include the DAF logic matrix workbook and "
+            "the Daily Sheet Action process document."
+        ),
+    )
+    st.markdown("### Governed reference context")
+    reference_columns = st.columns(2)
+    with reference_columns[0]:
+        reference_uploads = st.file_uploader(
+            "Reference datasets",
+            type=sorted(REFERENCE_SOURCE_EXTENSIONS),
+            accept_multiple_files=True,
+            key="policy_grounded_references",
+            help=(
+                "File names are mapped to known contracts such as conversion, "
+                "cookie dough, BSB, bacon, soup, APL, and Pantry."
+            ),
+        )
+    with reference_columns[1]:
+        reference_mapping_text = st.text_area(
+            "Snowflake object mappings",
+            placeholder=(
+                "conversion_mappings=DATABASE.SCHEMA.VIEW\n"
+                "compass_apl=DATABASE.SCHEMA.TABLE"
+            ),
+            key="policy_grounded_reference_objects",
+            help="One contract=table_or_view mapping per line.",
+        )
+    reference_object_mappings: dict[str, str] = {}
+    reference_mapping_errors: list[str] = []
+    for line_number, raw_line in enumerate(
+        reference_mapping_text.splitlines(),
+        start=1,
+    ):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            reference_mapping_errors.append(
+                f"Line {line_number} must use contract=object."
+            )
+            continue
+        contract, object_name = [
+            clean_text(value) for value in line.split("=", 1)
+        ]
+        if not contract or not object_name:
+            reference_mapping_errors.append(
+                f"Line {line_number} has a blank contract or object."
+            )
+            continue
+        reference_object_mappings[contract] = object_name
+    if reference_mapping_errors:
+        st.warning(" ".join(reference_mapping_errors))
+    detected_reference_contracts = sorted(
+        {
+            *reference_object_mappings,
+            *[
+                distillery_reference_contract_name(upload.name)
+                for upload in reference_uploads or []
+            ],
+        }
+    )
+    approved_reference_contracts = st.multiselect(
+        "Approved reference contracts for this candidate",
+        detected_reference_contracts,
+        default=[],
+        key="policy_grounded_reference_approvals",
+        help=(
+            "Approval freezes the uploaded content hash or Snowflake object "
+            "mapping into this candidate version."
+        ),
+    )
     upload_columns = st.columns(2)
     with upload_columns[0]:
         before_upload = st.file_uploader(
@@ -12023,6 +14846,17 @@ def render_rules_distillery_page(store: SnowflakeRulesStore) -> None:
     ) -> dict[str, Any]:
         if before_upload is None or after_upload is None:
             raise ValueError("Both BEFORE and AFTER evidence are required.")
+        reference_source_values = [
+            {
+                "name": clean_text(upload.name),
+                "data": upload.getvalue(),
+            }
+            for upload in reference_uploads or []
+        ]
+        for contract, object_name in reference_object_mappings.items():
+            reference_source_values.append(
+                store.snapshot_reference_object(contract, object_name)
+            )
         return run_rules_distillery(
             profile_id=profile_id,
             before_file_name=clean_text(before_upload.name),
@@ -12032,18 +14866,41 @@ def render_rules_distillery_page(store: SnowflakeRulesStore) -> None:
             run_holdouts=run_holdouts,
             outcome_aliases=persisted_aliases,
             approved_rule_signatures=signatures,
+            policy_sources=[
+                {
+                    "name": clean_text(upload.name),
+                    "data": upload.getvalue(),
+                }
+                for upload in policy_uploads or []
+            ],
+            reference_sources=reference_source_values,
+            reference_object_mappings=reference_object_mappings,
+            mutation_classifications=st.session_state.get(
+                f"_mutation_classifications_{profile_id}",
+                {},
+            ),
+            approved_reference_contracts=approved_reference_contracts,
+            approved_ambiguous_pair_ids=st.session_state.get(
+                ambiguity_approval_key,
+                approved_ambiguous_pair_ids,
+            ),
         )
 
     if st.button(
-        "Reconstruct literal filters",
+        "Compile policy-grounded candidate",
         type="primary",
-        disabled=before_upload is None or after_upload is None,
+        disabled=(
+            before_upload is None
+            or after_upload is None
+            or not policy_uploads
+            or bool(reference_mapping_errors)
+        ),
         key="literal_distillery_run",
     ):
         try:
             with st.spinner(
-                "Pairing every date, reconstructing pure filters, minimizing "
-                "logic, and validating all three outcomes..."
+                "Compiling the policy pack, pairing every date, resolving "
+                "stage-scoped residuals, and running mandatory holdouts..."
             ):
                 result = execute_distillery(approved_signatures)
             st.session_state["_literal_distillery_result"] = result
@@ -12053,7 +14910,7 @@ def render_rules_distillery_page(store: SnowflakeRulesStore) -> None:
                     f"Distillery run {result['run_id']} completed: "
                     f"{report['validation']['exact_count']:,}/"
                     f"{report['validation']['row_count']:,} exact rows and "
-                    f"{report['rules']['total']:,} literal filters."
+                    f"{report['rules']['total']:,} versioned rules."
                 ),
                 "success"
                 if result.get("deployment_eligible")
@@ -12127,18 +14984,187 @@ def render_rules_distillery_page(store: SnowflakeRulesStore) -> None:
             )
         else:
             observed = gate.get("observed") or {}
+            requirements = gate.get("requirements") or {}
             failures = [
                 f"{key.replace('_', ' ')}={value}"
                 for key, value in observed.items()
                 if (
-                    (key == "corpus_accuracy" and float(value or 0) != 1.0)
-                    or (key != "corpus_accuracy" and int(value or 0) != 0)
+                    (
+                        float(requirements.get(key) or 0.0) == 1.0
+                        and float(value or 0.0) != 1.0
+                    )
+                    or (
+                        float(requirements.get(key) or 0.0) == 0.0
+                        and float(value or 0.0) != 0.0
+                    )
                 )
             ]
             st.error(
                 "Activation is blocked. "
                 + (", ".join(failures) if failures else "Gate requirements failed.")
             )
+
+        ambiguous_matches = matching.get("ambiguous_match_records") or []
+        unresolved_ambiguous = [
+            item
+            for item in ambiguous_matches
+            if clean_text(item.get("status")) != "approved"
+        ]
+        if ambiguous_matches:
+            st.markdown("#### Ambiguous row matches")
+            st.caption(
+                "Similarity matching is evidence alignment only; these rows "
+                "cannot participate in activation until a person confirms the "
+                "BEFORE/AFTER pairing."
+            )
+            dataframe(pd.DataFrame(ambiguous_matches), height=300)
+        if unresolved_ambiguous:
+            ambiguous_by_id = {
+                clean_text(item.get("pair_id")): item
+                for item in unresolved_ambiguous
+            }
+            selected_ambiguous = st.multiselect(
+                "Confirm reviewed row pairings",
+                list(ambiguous_by_id),
+                format_func=lambda value: (
+                    f"{clean_text(ambiguous_by_id[value].get('source_group'))} "
+                    f"· {clean_text(ambiguous_by_id[value].get('case')) or value}"
+                ),
+                key=f"policy_ambiguous_review_{result.get('run_id')}",
+            )
+            if st.button(
+                "Approve selected pairings and rerun",
+                disabled=not selected_ambiguous,
+                key="policy_approve_ambiguous",
+            ):
+                st.session_state[ambiguity_approval_key] = sorted(
+                    set(approved_ambiguous_pair_ids)
+                    | set(selected_ambiguous)
+                )
+                with st.spinner(
+                    "Rebuilding with reviewed evidence alignment..."
+                ):
+                    rebuilt = execute_distillery(approved_signatures)
+                st.session_state["_literal_distillery_result"] = rebuilt
+                set_flash("Reviewed ambiguous pairings were approved.")
+                safe_rerun()
+
+        st.markdown("#### Policy and reference readiness")
+        policy_report = report.get("policy_pack") or {}
+        reference_report = report.get("reference_contracts") or {}
+        readiness_columns = st.columns(5)
+        readiness_columns[0].metric(
+            "Policy sources",
+            int(policy_report.get("source_count") or 0),
+        )
+        readiness_columns[1].metric(
+            "Policy clauses",
+            int(policy_report.get("clause_count") or 0),
+        )
+        readiness_columns[2].metric(
+            "Reference mapped",
+            len(reference_report.get("uploaded") or [])
+            + len(
+                reference_report.get("snowflake_object_mappings") or {}
+            ),
+        )
+        readiness_columns[3].metric(
+            "Reference missing",
+            len(reference_report.get("missing") or []),
+        )
+        readiness_columns[4].metric(
+            "Reference pending",
+            len(reference_report.get("pending_approval") or []),
+        )
+        if policy_report.get("errors"):
+            st.error("One or more policy sources could not be normalized.")
+            dataframe(pd.DataFrame(policy_report.get("errors") or []))
+        with st.expander("Policy source lineage", expanded=False):
+            dataframe(
+                pd.DataFrame(policy_report.get("sources") or []),
+                height=320,
+            )
+            if policy_report.get("duplicate_variant_ids"):
+                st.caption(
+                    "Duplicate rule IDs are preserved as clause variants: "
+                    + ", ".join(
+                        policy_report.get("duplicate_variant_ids") or []
+                    )
+                )
+        if reference_report.get("missing"):
+            st.warning(
+                "Missing governed reference contracts: "
+                + ", ".join(reference_report.get("missing") or [])
+            )
+        candidate_reference_rows = (
+            reference_report.get("candidate_rows") or []
+        )
+        if candidate_reference_rows:
+            with st.expander(
+                "Candidate reference rows inferred from stable enrichment deltas",
+                expanded=False,
+            ):
+                st.caption(
+                    "These rows are evidence proposals only. Upload or map an "
+                    "approved governed dataset before they can affect rules."
+                )
+                dataframe(
+                    pd.DataFrame(candidate_reference_rows),
+                    height=420,
+                )
+
+        st.markdown("#### BEFORE / AFTER mutation classification")
+        mutation_inventory = report.get("mutation_inventory") or {}
+        mutation_frame = pd.DataFrame(
+            [
+                {
+                    "Field": clean_text(item.get("field_name")),
+                    "Changed rows": int(item.get("changed_rows") or 0),
+                    "Classification": clean_text(
+                        item.get("classification")
+                    ),
+                }
+                for item in mutation_inventory.get("records") or []
+            ]
+        )
+        if not mutation_frame.empty:
+            edited_mutations = st.data_editor(
+                mutation_frame,
+                disabled=["Field", "Changed rows"],
+                hide_index=True,
+                use_container_width=True,
+                column_config={
+                    "Classification": st.column_config.SelectboxColumn(
+                        options=[
+                            "enrichment",
+                            "correction",
+                            "volatile_metadata",
+                            "unresolved",
+                        ],
+                        required=True,
+                    )
+                },
+                key=f"policy_mutations_{result.get('run_id')}",
+            )
+            if st.button(
+                "Apply mutation classifications and rerun",
+                key="policy_apply_mutation_classifications",
+            ):
+                st.session_state[
+                    f"_mutation_classifications_{profile_id}"
+                ] = {
+                    clean_text(row.get("Field")): clean_text(
+                        row.get("Classification")
+                    )
+                    for row in edited_mutations.to_dict(orient="records")
+                }
+                with st.spinner(
+                    "Recompiling with the reviewed mutation contract..."
+                ):
+                    rebuilt = execute_distillery(approved_signatures)
+                st.session_state["_literal_distillery_result"] = rebuilt
+                set_flash("Mutation classifications applied.")
+                safe_rerun()
 
         labels = report.get("labels") or {}
         alias_registry = labels.get("alias_registry") or {}
@@ -12261,6 +15287,22 @@ def render_rules_distillery_page(store: SnowflakeRulesStore) -> None:
                 {
                     "Rule": clean_text(rule.get("name")),
                     "Kind": clean_text(source.get("distilled_rule_kind")),
+                    "Stage": int(source.get("policy_stage") or 0),
+                    "Stage code": clean_text(
+                        source.get("policy_stage_code")
+                    ),
+                    "Source clause": clean_text(
+                        source.get("policy_clause_id")
+                    ),
+                    "Policy status": clean_text(
+                        source.get("amendment_status")
+                    )
+                    or (
+                        "known_anchor"
+                        if clean_text(source.get("kind"))
+                        == "policy_scaffold"
+                        else ""
+                    ),
                     "Filter logic": clean_text(source.get("filter_logic")),
                     "ACTION": clean_text(outcome.get("action")),
                     "If In Stock: Action": clean_text(
@@ -12270,6 +15312,15 @@ def render_rules_distillery_page(store: SnowflakeRulesStore) -> None:
                     "Supporting dates": ", ".join(
                         source.get("source_groups") or []
                     ),
+                    "Reference dependencies": ", ".join(
+                        source.get("reference_dependencies") or []
+                    ),
+                    "Output effects": json.dumps(
+                        source.get("output_effects") or {},
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    "Rationale": clean_text(source.get("rationale")),
                     "Covered rows": int(source.get("support") or 0),
                     "Approval": (
                         "Approved"
@@ -12281,35 +15332,50 @@ def render_rules_distillery_page(store: SnowflakeRulesStore) -> None:
                     ),
                 }
             )
-        reusable_records = [
-            row for row in rule_records if row["Kind"] == "reusable"
+        source_backed_records = [
+            row
+            for row in rule_records
+            if row["Policy status"] in {"source_backed", "known_anchor"}
+        ]
+        amendment_records = [
+            row
+            for row in rule_records
+            if row["Policy status"] == "draft_amendment"
         ]
         one_date_records = [
             row for row in rule_records if row["Kind"] == "one_date"
         ]
         rules_tabs = st.tabs(
             [
-                f"Reusable filters ({len(reusable_records)})",
+                f"Known + source-backed ({len(source_backed_records)})",
+                f"Draft amendments ({len(amendment_records)})",
                 f"One-date review ({len(one_date_records)})",
                 f"Gaps ({len(result.get('gaps') or [])})",
                 f"Conflicts ({len(result.get('conflicts') or [])})",
             ]
         )
         with rules_tabs[0]:
-            if reusable_records:
-                dataframe(pd.DataFrame(reusable_records), height=560)
+            if source_backed_records:
+                dataframe(pd.DataFrame(source_backed_records), height=560)
             else:
-                st.caption("No reusable filters were discovered.")
+                st.caption(
+                    "No candidate filters have been tied directly to an "
+                    "uploaded policy clause."
+                )
         with rules_tabs[1]:
-            if one_date_records:
-                dataframe(pd.DataFrame(one_date_records), height=480)
-                pending = report.get("pending_rule_approvals") or []
+            if amendment_records:
+                dataframe(pd.DataFrame(amendment_records), height=480)
+                pending = [
+                    *(report.get("pending_amendments") or []),
+                    *(report.get("pending_rule_approvals") or []),
+                ]
                 pending_by_signature = {
                     clean_text(item.get("logic_signature")): item
                     for item in pending
+                    if clean_text(item.get("logic_signature"))
                 }
                 selected_approvals = st.multiselect(
-                    "Approve one-date filters",
+                    "Approve explicit policy amendments",
                     list(pending_by_signature),
                     format_func=lambda value: clean_text(
                         pending_by_signature[value].get("name")
@@ -12332,7 +15398,7 @@ def render_rules_distillery_page(store: SnowflakeRulesStore) -> None:
                             rebuilt = execute_distillery(combined)
                         st.session_state["_literal_distillery_result"] = rebuilt
                         set_flash(
-                            f"Applied {len(combined):,} explicit one-date "
+                            f"Applied {len(combined):,} explicit amendment "
                             "approval(s) and rebuilt the candidate."
                         )
                         safe_rerun()
@@ -12340,23 +15406,45 @@ def render_rules_distillery_page(store: SnowflakeRulesStore) -> None:
                         render_actionable_exception(
                             "The candidate could not be rebuilt with approvals.",
                             exc,
-                            component="Distillery one-date approval",
+                            component="Distillery amendment approval",
                             context={"profile_id": profile_id},
                         )
             else:
-                st.caption("No one-date filters require approval.")
+                st.caption("No undocumented corpus amendments were proposed.")
         with rules_tabs[2]:
+            if one_date_records:
+                dataframe(pd.DataFrame(one_date_records), height=560)
+            else:
+                st.caption("No one-date rules require separate review.")
+        with rules_tabs[3]:
             gaps = result.get("gaps") or []
             if gaps:
+                clusters = (
+                    (report.get("gaps") or {}).get("clusters") or []
+                )
+                if clusters:
+                    st.caption(
+                        "Residual clusters are the next Distillery iteration "
+                        "units; individual evidence remains available below."
+                    )
+                    dataframe(pd.DataFrame(clusters), height=360)
                 dataframe(pd.DataFrame(gaps), height=560)
             else:
                 st.success("No unexplained rows remain.")
-        with rules_tabs[3]:
+        with rules_tabs[4]:
             conflicts = result.get("conflicts") or []
             if conflicts:
                 dataframe(pd.DataFrame(conflicts), height=560)
             else:
                 st.success("No conflicting filters remain.")
+
+        convergence = report.get("convergence") or []
+        if convergence:
+            with st.expander(
+                "Distillery convergence by policy stage",
+                expanded=True,
+            ):
+                dataframe(pd.DataFrame(convergence), height=360)
 
         folds = holdout.get("folds") or {}
         if isinstance(folds, Mapping) and folds:
@@ -12389,9 +15477,20 @@ def render_rules_distillery_page(store: SnowflakeRulesStore) -> None:
                 )
         with st.expander("Complete Distillery report", expanded=False):
             st.json(report)
+            complete_export = {
+                "run_id": clean_text(result.get("run_id")),
+                "profile_id": profile_id,
+                "report": report,
+                "catalog": catalog,
+                "gaps": result.get("gaps") or [],
+                "conflicts": result.get("conflicts") or [],
+                "policy_pack": result.get("policy_pack") or {},
+                "reference_pack": result.get("reference_pack") or {},
+                "exported_at": iso_now(),
+            }
             st.download_button(
-                "Download validation report",
-                data=json_dumps(report, pretty=True),
+                "Download complete candidate package",
+                data=json_dumps(complete_export, pretty=True),
                 file_name=(
                     "one_engine_distillery_"
                     f"{clean_text(result.get('run_id'))}.json"
@@ -12408,7 +15507,10 @@ def render_rules_distillery_page(store: SnowflakeRulesStore) -> None:
         if st.button(
             "Save candidate version to Snowflake",
             key="literal_save_candidate",
-            disabled=not catalog,
+            disabled=(
+                not catalog
+                or not bool_value(holdout.get("completed"))
+            ),
         ):
             try:
                 version = store.save_catalog_candidate(
@@ -12436,8 +15538,8 @@ def render_rules_distillery_page(store: SnowflakeRulesStore) -> None:
                 )
     else:
         st.caption(
-            "Upload paired evidence and reconstruct literal filters. Existing "
-            "saved versions remain available below."
+            "Upload the policy pack and paired evidence to compile the next "
+            "Distillery iteration. Existing versions remain available below."
         )
 
     st.divider()

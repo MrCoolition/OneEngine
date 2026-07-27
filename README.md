@@ -72,8 +72,9 @@ rejects two physically present but completely empty spreadsheet rows, leaving
 | Ambiguous duplicate alignments | 2 |
 | Atomic AFTER outcome fields | 3 |
 
-Every run recomputes filter coverage, aliases, gaps, conflicts, corpus parity,
-and optional leave-one-date-out validation. No fixed generated catalog is kept
+Every run recompiles the uploaded policy pack, recomputes stage-scoped
+residual coverage, aliases, gaps, conflicts, corpus parity, and mandatory
+leave-one-date-out validation. No fixed generated catalog is kept
 in this repository, and ONE ENGINE does not manufacture row-specific fallback
 rules to claim parity. A corpus that still contains unexplained decisions is
 saved as an ineligible candidate with persistent gaps; activation remains
@@ -83,26 +84,37 @@ blocked until those gaps are resolved with governed business logic.
 
 1. Open **Rules Distillery** in ONE ENGINE.
 2. Select the workflow profile.
-3. Upload the accumulated BEFORE and AFTER files. A ZIP can contain many
+3. Upload the standardized logic matrix and process documents. The 53 currently
+   known Product Request rules are partial anchors, not a completeness target.
+4. Map or upload the governed reference datasets used by the policy.
+5. Upload the accumulated BEFORE and AFTER files. A ZIP can contain many
    matching source files.
-4. Review raw and canonical permutations for the atomic result:
+6. Classify non-output mutations as enrichment, correction, volatile metadata,
+   or unresolved.
+7. Review raw and canonical permutations for the atomic result:
    `ACTION`, `If In Stock: Action`, and `Audit Action`.
-5. Review uncertain aliases, reusable filters, one-date filters, conflicts,
-   and persistent gaps.
-6. Save an immutable candidate version.
-7. Compare active versus candidate results against an uploaded file, live
+8. Review uncertain aliases, source-backed rules, draft amendments, one-date
+   rules, residual clusters, conflicts, and persistent gaps.
+9. Save an immutable candidate version after mandatory holdout validation.
+10. Compare active versus candidate results against an uploaded file, live
    Product Request data, or an existing batch. This comparison is read-only.
-8. Activate an eligible candidate, or roll back to any retained version.
+11. Activate an eligible candidate, or roll back to any retained version.
 
 The promotion gate requires:
 
 - 100% exact accumulated-corpus parity;
 - zero unmatched rows;
+- zero unresolved ambiguous evidence matches;
 - zero contradictory identical input states;
 - zero filter conflicts and unresolved gaps;
 - zero pending outcome-alias reviews;
+- zero missing, contradictory, or pending governed reference contracts;
+- zero pending policy amendments;
 - explicit approval for every filter supported by only one date;
-- zero SHA, Case#, pair-ID, or exact-row predicates.
+- 100% minimum leave-one-date-out accuracy;
+- zero SHA, Case#, pair-ID, source-date, raw-note, arbitrary product-text, or
+  sampled-threshold predicates;
+- passing numeric-boundary and metamorphic invariance tests.
 
 SHA-256 values remain source and evidence lineage metadata only. They are not
 available in the runtime predicate context and cannot route a Product Request.
@@ -149,8 +161,10 @@ provisions the eleven-table backend:
 - `COMPLIANCE_RULES_OUTCOME_ALIASES`
 
 The script also migrates existing `COMPLIANCE_RULES_WORKFLOW_ROWS` tables with
-the `AUDIT_ACTION` column. The app performs no runtime DDL. Run the backend SQL
-before deploying this app version, then use **Settings → Verify backend
+the `AUDIT_ACTION` column and upgrades `COMPLIANCE_RULES_REFERENCE_LISTS` into
+a workflow-aware, typed, versioned dataset contract while retaining legacy
+simple-list compatibility. The app performs no runtime DDL. Run the backend
+SQL before deploying this app version, then use **Settings → Verify backend
 tables**.
 
 ### Live Product Request source
@@ -181,7 +195,9 @@ py -3 -m unittest discover -s tests -v
 
 The contracts verify the embedded seed catalog, application self-check,
 complete 10-date/6,920-row evidence alignment, the three-field atomic outcome,
-safe alias review, literal-filter minimization, identity-predicate exclusion,
-blank clearing, candidate isolation, and the versioned Snowflake contract.
+safe alias review, policy-stage minimization, policy boundary enforcement,
+typed reference enrichment, preserve/set/clear effects, identity-predicate
+exclusion, blank clearing, candidate isolation, and the versioned Snowflake
+contract.
 
 Do not commit `.env` or `.streamlit/secrets.toml`.

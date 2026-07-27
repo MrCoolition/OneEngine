@@ -129,6 +129,16 @@ class OneEngineContractTests(unittest.TestCase):
             "ADD COLUMN IF NOT EXISTS AUDIT_ACTION VARCHAR",
             backend,
         )
+        for typed_reference_column in (
+            "DATASET_VERSION_ID",
+            "VALUE_JSON",
+            "SOURCE_SHA256",
+            "APPROVED_AT",
+        ):
+            self.assertIn(
+                f"ADD COLUMN IF NOT EXISTS {typed_reference_column}",
+                backend,
+            )
         self.assertIn(
             "Direct Distillery promotion is disabled",
             source,
