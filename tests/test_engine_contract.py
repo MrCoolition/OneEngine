@@ -58,7 +58,78 @@ class OneEngineContractTests(unittest.TestCase):
         self.assertIn('[data-testid="stHeader"]', css)
         self.assertIn('[data-testid="stSidebarCollapsedControl"]', css)
         self.assertIn("background: rgba(247, 248, 249, .98)", css)
+        self.assertIn(
+            '[data-testid="stAlert"] p',
+            css,
+        )
+        self.assertIn(
+            "color: var(--fb-neutral-900) !important",
+            css,
+        )
         self.assertIn("ONE_ENGINE_FOODBUY_DESIGN_SYSTEM", self.app.DEPLOYMENT_SENTINEL)
+
+    def test_distillery_operator_workflow_contract(self) -> None:
+        source = APP_PATH.read_text(encoding="utf-8")
+
+        self.assertIn(
+            "render_rules_distillery_operator_page(store)",
+            source,
+        )
+        for workspace in (
+            "Review latest run",
+            "New distillation",
+            "Saved versions",
+        ):
+            self.assertIn(f'"{workspace}"', source)
+        for review_area in (
+            "Candidate rules",
+            "Residual clusters",
+            "Data readiness",
+            "Validation",
+        ):
+            self.assertIn(f'"{review_area}"', source)
+        self.assertIn(
+            '"Save immutable draft"',
+            source,
+        )
+        self.assertIn(
+            '"Run activation validation"',
+            source,
+        )
+        self.assertIn(
+            "run_holdouts=False",
+            source,
+        )
+        self.assertIn(
+            "run_holdouts=True",
+            source,
+        )
+        self.assertIn(
+            '"Prepare full export"',
+            source,
+        )
+
+        blockers = self.app.distillery_gate_blockers(
+            {
+                "deployment_gate": {
+                    "requirements": {
+                        "corpus_accuracy": 1.0,
+                        "gaps": 0,
+                        "metamorphic_failures": 0,
+                    },
+                    "observed": {
+                        "corpus_accuracy": 0.3333815,
+                        "gaps": 4613,
+                        "metamorphic_failures": 0,
+                    },
+                }
+            }
+        )
+        self.assertEqual(2, len(blockers))
+        self.assertEqual("Corpus parity", blockers[0]["Blocker"])
+        self.assertEqual("33.34%", blockers[0]["Current"])
+        self.assertEqual("Unexplained rows", blockers[1]["Blocker"])
+        self.assertEqual(4613, blockers[1]["Current"])
 
     def test_brand_asset_resolution_uses_snowflake_project_root(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

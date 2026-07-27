@@ -72,33 +72,38 @@ rejects two physically present but completely empty spreadsheet rows, leaving
 | Ambiguous duplicate alignments | 2 |
 | Atomic AFTER outcome fields | 3 |
 
-Every run recompiles the uploaded policy pack, recomputes stage-scoped
-residual coverage, aliases, gaps, conflicts, corpus parity, and mandatory
-leave-one-date-out validation. No fixed generated catalog is kept
-in this repository, and ONE ENGINE does not manufacture row-specific fallback
-rules to claim parity. A corpus that still contains unexplained decisions is
-saved as an ineligible candidate with persistent gaps; activation remains
-blocked until those gaps are resolved with governed business logic.
+The responsive discovery pass recompiles the uploaded policy pack and
+recomputes stage-scoped residual coverage, aliases, gaps, conflicts, and corpus
+parity. The expensive mandatory leave-one-date-out suite is an explicit
+activation-validation action, so reviewing a table or changing a screen does
+not rerun the corpus. No fixed generated catalog is kept in this repository,
+and ONE ENGINE does not manufacture row-specific fallback rules to claim
+parity. A corpus that still contains unexplained decisions can be saved and
+tested as an ineligible immutable draft with persistent gaps; activation
+remains blocked until those gaps are resolved with governed business logic.
 
 ## Rules Distillery workflow
 
-1. Open **Rules Distillery** in ONE ENGINE.
+1. Open **Rules Distillery** in ONE ENGINE and choose **New distillation**.
 2. Select the workflow profile.
 3. Upload the standardized logic matrix and process documents. The 53 currently
    known Product Request rules are partial anchors, not a completeness target.
 4. Map or upload the governed reference datasets used by the policy.
 5. Upload the accumulated BEFORE and AFTER files. A ZIP can contain many
    matching source files.
-6. Classify non-output mutations as enrichment, correction, volatile metadata,
-   or unresolved.
-7. Review raw and canonical permutations for the atomic result:
+6. Run the quick discovery pass, then use **Review latest run** to work one
+   operator surface at a time instead of rendering the entire evidence package.
+7. Classify non-output mutations as enrichment, correction, volatile metadata,
+   or unresolved. Review raw and canonical permutations for the atomic result:
    `ACTION`, `If In Stock: Action`, and `Audit Action`.
 8. Review uncertain aliases, source-backed rules, draft amendments, one-date
    rules, residual clusters, conflicts, and persistent gaps.
-9. Save an immutable candidate version after mandatory holdout validation.
-10. Compare active versus candidate results against an uploaded file, live
+9. Save an immutable draft whenever a useful iteration should be preserved.
+   Saving never changes active rules and does not imply activation eligibility.
+10. From **Saved versions**, compare active versus candidate results against an uploaded file, live
    Product Request data, or an existing batch. This comparison is read-only.
-11. Activate an eligible candidate, or roll back to any retained version.
+11. Run full activation validation. Activate only an eligible candidate, or
+    roll back to any retained version.
 
 The promotion gate requires:
 

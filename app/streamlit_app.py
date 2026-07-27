@@ -49,12 +49,12 @@ except Exception:  # Enables import-based engine tests outside Snowflake.
 
 
 APP_TITLE = "ONE ENGINE"
-APP_VERSION = "2026.07.27-one-engine-policy-distillery-v7"
-SESSION_STATE_SCHEMA_VERSION = 8
+APP_VERSION = "2026.07.27-one-engine-distillery-operator-v8"
+SESSION_STATE_SCHEMA_VERSION = 9
 WORKBOOK_PARSER_VERSION = "2026.07.24-v7-uncached"
 MAX_DIAGNOSTIC_EVENTS = 50
 DEPLOYMENT_SENTINEL = (
-    "ONE_ENGINE_FOODBUY_DESIGN_SYSTEM_ELITE_POLICY_GROUNDED_DISTILLERY_20260727"
+    "ONE_ENGINE_FOODBUY_DESIGN_SYSTEM_DISTILLERY_OPERATOR_20260727"
 )
 LIVE_BUILD_BADGE = "ONE ENGINE · SNOWFLAKE · LIVE"
 FOODBUY_DESIGN_SYSTEM_REFERENCE = (
@@ -12657,6 +12657,29 @@ def app_styles() -> None:
             box-shadow: none;
         }
 
+        /*
+         * Snowflake can apply its own light alert surfaces after Streamlit
+         * resolves theme tokens. Always keep alert copy dark enough to read;
+         * this specifically prevents white text on the canary warning surface.
+         */
+        [data-testid="stAlert"],
+        [data-testid="stAlert"] div,
+        [data-testid="stAlert"] p,
+        [data-testid="stAlert"] span,
+        [data-testid="stAlert"] li {
+            color: var(--fb-neutral-900) !important;
+        }
+
+        [data-testid="stAlert"] a {
+            color: var(--fb-secondary-800) !important;
+            text-decoration: underline;
+        }
+
+        [data-testid="stAlert"] svg {
+            color: currentColor !important;
+            fill: currentColor !important;
+        }
+
         [data-testid="stExpander"] {
             overflow: hidden;
             background: var(--fb-neutral-white);
@@ -15859,6 +15882,1770 @@ def render_rules_distillery_page(store: SnowflakeRulesStore) -> None:
             st.caption("No catalog-version audit events have been recorded.")
 
 
+DISTILLERY_GATE_COPY: dict[str, tuple[str, str]] = {
+    "corpus_accuracy": (
+        "Corpus parity",
+        "Continue residual discovery until every historical row receives the exact three-field outcome.",
+    ),
+    "unmatched_rows": (
+        "Unmatched evidence rows",
+        "Correct the dated BEFORE/AFTER files or their row keys.",
+    ),
+    "unresolved_ambiguous_matches": (
+        "Ambiguous row pairings",
+        "Review and confirm the proposed BEFORE/AFTER pairings in Data readiness.",
+    ),
+    "contradictions": (
+        "Contradictory evidence",
+        "Inspect rows with identical governed context but different outcomes.",
+    ),
+    "gaps": (
+        "Unexplained rows",
+        "Work the largest residual clusters first; add semantic context, a governed reference, or a policy amendment.",
+    ),
+    "filter_conflicts": (
+        "Conflicting rules",
+        "Resolve same-stage filters that produce different terminal outcomes.",
+    ),
+    "pending_rule_approvals": (
+        "One-date rules awaiting review",
+        "Approve only supported exceptions or collect another date of evidence.",
+    ),
+    "pending_amendments": (
+        "Draft policy amendments",
+        "Review corpus-discovered behavior and explicitly approve valid amendments.",
+    ),
+    "pending_alias_reviews": (
+        "Outcome aliases awaiting review",
+        "Resolve uncertain ACTION spelling or spacing variants in Data readiness.",
+    ),
+    "pending_reference_contracts": (
+        "Reference datasets awaiting approval",
+        "Approve the frozen dataset versions used by this candidate.",
+    ),
+    "missing_reference_contracts": (
+        "Missing governed references",
+        "Upload or map the required Product Request reference datasets.",
+    ),
+    "reference_contradictions": (
+        "Reference contradictions",
+        "Correct duplicate reference keys that resolve to different values.",
+    ),
+    "unresolved_mutation_classifications": (
+        "Unclassified field changes",
+        "Classify each non-output mutation as enrichment, correction, volatile metadata, or unresolved.",
+    ),
+    "policy_pack_errors_or_missing": (
+        "Policy pack not ready",
+        "Provide a readable logic matrix and resolve policy-source parsing errors.",
+    ),
+    "holdout_incomplete": (
+        "Activation validation not run",
+        "Run full activation validation when the candidate is ready for a serious gate check.",
+    ),
+    "minimum_holdout_accuracy": (
+        "Minimum date holdout accuracy",
+        "Improve reusable logic until every held-out date reproduces exactly.",
+    ),
+    "metamorphic_failures": (
+        "Identity-invariance failures",
+        "Remove logic that changes when Case, SHA, source date, notes, or row order changes.",
+    ),
+    "unsupported_boundary_predicates": (
+        "Unsupported numeric boundaries",
+        "Use documented or explicitly approved thresholds only.",
+    ),
+    "forbidden_runtime_predicates": (
+        "Forbidden identity predicates",
+        "Remove Case, SHA, dates, row fingerprints, and other identity memorization from executable filters.",
+    ),
+}
+
+
+def distillery_gate_blockers(report: Mapping[str, Any]) -> list[dict[str, Any]]:
+    gate = report.get("deployment_gate") or {}
+    observed = gate.get("observed") or {}
+    requirements = gate.get("requirements") or {}
+    blockers: list[dict[str, Any]] = []
+    for key, required in requirements.items():
+        value = observed.get(key, 0)
+        try:
+            numeric_value = float(value or 0.0)
+            numeric_required = float(required or 0.0)
+            passed = (
+                numeric_value == numeric_required
+                if numeric_required in {0.0, 1.0}
+                else numeric_value >= numeric_required
+            )
+        except (TypeError, ValueError):
+            passed = value == required
+        if passed:
+            continue
+        label, next_action = DISTILLERY_GATE_COPY.get(
+            clean_text(key),
+            (
+                clean_text(key).replace("_", " ").title(),
+                "Resolve this activation requirement before promotion.",
+            ),
+        )
+        display_value: Any = value
+        display_required: Any = required
+        if clean_text(key) in {
+            "corpus_accuracy",
+            "minimum_holdout_accuracy",
+        }:
+            display_value = f"{float(value or 0.0):.2%}"
+            display_required = f"{float(required or 0.0):.0%}"
+        blockers.append(
+            {
+                "Blocker": label,
+                "Current": display_value,
+                "Required": display_required,
+                "Next action": next_action,
+                "_key": clean_text(key),
+            }
+        )
+    return blockers
+
+
+def distillery_rule_review_records(
+    catalog: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for rule in catalog:
+        source = rule.get("source") or {}
+        outcome = source.get("outcome") or {}
+        policy_status = clean_text(source.get("amendment_status"))
+        if not policy_status and clean_text(source.get("kind")) == "policy_scaffold":
+            policy_status = "known_anchor"
+        records.append(
+            {
+                "Rule": clean_text(rule.get("name")),
+                "Status": policy_status or clean_text(
+                    source.get("distilled_rule_kind")
+                ),
+                "Stage": int(source.get("policy_stage") or 0),
+                "Source clause": clean_text(
+                    source.get("policy_clause_id")
+                ),
+                "Filter logic": clean_text(source.get("filter_logic")),
+                "ACTION": clean_text(outcome.get("action")),
+                "If In Stock: Action": clean_text(
+                    outcome.get("if_in_stock_action")
+                ),
+                "Audit Action": clean_text(outcome.get("audit_action")),
+                "Covered rows": int(source.get("support") or 0),
+                "Supporting dates": ", ".join(
+                    source.get("source_groups") or []
+                ),
+                "Approval": (
+                    "Approved"
+                    if bool_value(source.get("approved"))
+                    else "Review required"
+                ),
+                "Logic signature": clean_text(
+                    source.get("logic_signature")
+                ),
+            }
+        )
+    return records
+
+
+def run_distillery_source_bundle(
+    store: SnowflakeRulesStore,
+    bundle: Mapping[str, Any],
+    *,
+    run_holdouts: bool,
+    outcome_aliases: Mapping[str, Any] | None = None,
+    approved_rule_signatures: Sequence[str] | None = None,
+    mutation_classifications: Mapping[str, Any] | None = None,
+    approved_ambiguous_pair_ids: Sequence[str] | None = None,
+) -> dict[str, Any]:
+    return run_rules_distillery(
+        profile_id=clean_text(bundle.get("profile_id")),
+        before_file_name=clean_text(bundle.get("before_file_name")),
+        before_bytes=bytes(bundle.get("before_bytes") or b""),
+        after_file_name=clean_text(bundle.get("after_file_name")),
+        after_bytes=bytes(bundle.get("after_bytes") or b""),
+        run_holdouts=run_holdouts,
+        outcome_aliases=outcome_aliases or {},
+        approved_rule_signatures=approved_rule_signatures or [],
+        policy_sources=bundle.get("policy_sources") or [],
+        reference_sources=bundle.get("reference_sources") or [],
+        reference_object_mappings=(
+            bundle.get("reference_object_mappings") or {}
+        ),
+        mutation_classifications=mutation_classifications or {},
+        approved_reference_contracts=(
+            bundle.get("approved_reference_contracts") or []
+        ),
+        approved_ambiguous_pair_ids=approved_ambiguous_pair_ids or [],
+    )
+
+
+def render_distillery_new_run(
+    store: SnowflakeRulesStore,
+    profile_id: str,
+    *,
+    persisted_aliases: Mapping[str, Any],
+) -> None:
+    st.markdown("### Start a distillation")
+    st.caption(
+        "Discover first, then review the residuals. Full leave-one-date-out "
+        "validation is a separate deliberate action so ordinary screen "
+        "interactions do not rerun the expensive corpus analysis."
+    )
+    policy_uploads = st.file_uploader(
+        "1. Policy sources",
+        type=sorted(POLICY_SOURCE_EXTENSIONS),
+        accept_multiple_files=True,
+        key="distillery_v8_policy_sources",
+        help=(
+            "Include the Product Request logic matrix and any supporting "
+            "process documents. They are evidence anchors, not a rule ceiling."
+        ),
+    )
+    evidence_columns = st.columns(2)
+    with evidence_columns[0]:
+        before_upload = st.file_uploader(
+            "2. BEFORE evidence",
+            type=["zip", *sorted(DISTILLERY_SUPPORTED_EXTENSIONS)],
+            key="distillery_v8_before",
+        )
+    with evidence_columns[1]:
+        after_upload = st.file_uploader(
+            "3. AFTER evidence",
+            type=["zip", *sorted(DISTILLERY_SUPPORTED_EXTENSIONS)],
+            key="distillery_v8_after",
+        )
+
+    with st.expander("Optional governed reference context", expanded=False):
+        reference_columns = st.columns(2)
+        with reference_columns[0]:
+            reference_uploads = st.file_uploader(
+                "Reference datasets",
+                type=sorted(REFERENCE_SOURCE_EXTENSIONS),
+                accept_multiple_files=True,
+                key="distillery_v8_reference_sources",
+            )
+        with reference_columns[1]:
+            mapping_text = st.text_area(
+                "Snowflake object mappings",
+                placeholder=(
+                    "conversion_mappings=DATABASE.SCHEMA.VIEW\n"
+                    "compass_apl=DATABASE.SCHEMA.TABLE"
+                ),
+                key="distillery_v8_reference_objects",
+            )
+        reference_object_mappings: dict[str, str] = {}
+        mapping_errors: list[str] = []
+        for line_number, raw_line in enumerate(
+            mapping_text.splitlines(),
+            start=1,
+        ):
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                mapping_errors.append(
+                    f"Line {line_number} must use contract=object."
+                )
+                continue
+            contract, object_name = [
+                clean_text(value) for value in line.split("=", 1)
+            ]
+            if not contract or not object_name:
+                mapping_errors.append(
+                    f"Line {line_number} has a blank contract or object."
+                )
+                continue
+            reference_object_mappings[contract] = object_name
+        if mapping_errors:
+            st.warning(" ".join(mapping_errors))
+        detected_contracts = sorted(
+            {
+                *reference_object_mappings,
+                *[
+                    distillery_reference_contract_name(upload.name)
+                    for upload in reference_uploads or []
+                ],
+            }
+        )
+        approved_reference_contracts = st.multiselect(
+            "Approve frozen reference contracts",
+            detected_contracts,
+            default=[],
+            key="distillery_v8_reference_approvals",
+        )
+
+    ready = (
+        bool(policy_uploads)
+        and before_upload is not None
+        and after_upload is not None
+        and not mapping_errors
+    )
+    st.info(
+        "Discovery pairs and analyzes the entire corpus. It does not write "
+        "rules, workflow rows, or catalog versions."
+    )
+    if st.button(
+        "Discover candidate rules",
+        type="primary",
+        disabled=not ready,
+        key="distillery_v8_discover",
+    ):
+        try:
+            reference_sources = [
+                {
+                    "name": clean_text(upload.name),
+                    "data": upload.getvalue(),
+                }
+                for upload in reference_uploads or []
+            ]
+            with st.status(
+                "Preparing governed evidence...",
+                expanded=True,
+            ) as progress:
+                for contract, object_name in (
+                    reference_object_mappings.items()
+                ):
+                    progress.write(
+                        f"Freezing {contract} from {object_name}."
+                    )
+                    reference_sources.append(
+                        store.snapshot_reference_object(
+                            contract,
+                            object_name,
+                        )
+                    )
+                bundle = {
+                    "profile_id": profile_id,
+                    "before_file_name": clean_text(before_upload.name),
+                    "before_bytes": before_upload.getvalue(),
+                    "after_file_name": clean_text(after_upload.name),
+                    "after_bytes": after_upload.getvalue(),
+                    "policy_sources": [
+                        {
+                            "name": clean_text(upload.name),
+                            "data": upload.getvalue(),
+                        }
+                        for upload in policy_uploads or []
+                    ],
+                    "reference_sources": reference_sources,
+                    "reference_object_mappings": (
+                        reference_object_mappings
+                    ),
+                    "approved_reference_contracts": (
+                        approved_reference_contracts
+                    ),
+                }
+                progress.update(
+                    label=(
+                        "Pairing dated files and discovering stage-scoped "
+                        "residual logic..."
+                    ),
+                    state="running",
+                )
+                result = run_distillery_source_bundle(
+                    store,
+                    bundle,
+                    run_holdouts=False,
+                    outcome_aliases=persisted_aliases,
+                    approved_rule_signatures=st.session_state.get(
+                        f"_literal_rule_approvals_{profile_id}",
+                        [],
+                    ),
+                    mutation_classifications=st.session_state.get(
+                        f"_mutation_classifications_{profile_id}",
+                        {},
+                    ),
+                    approved_ambiguous_pair_ids=st.session_state.get(
+                        f"_approved_ambiguous_pairs_{profile_id}",
+                        [],
+                    ),
+                )
+                progress.update(
+                    label="Discovery complete.",
+                    state="complete",
+                )
+            st.session_state["_literal_distillery_result"] = result
+            st.session_state["_distillery_v8_source_bundle"] = bundle
+            st.session_state["_distillery_v8_pending_workspace"] = (
+                "Review latest run"
+            )
+            set_flash(
+                (
+                    f"Discovery completed: "
+                    f"{int((result.get('report') or {}).get('validation', {}).get('exact_count') or 0):,} "
+                    "rows currently explained. Review residual clusters next."
+                ),
+                "success",
+            )
+            safe_rerun()
+        except Exception as exc:
+            render_actionable_exception(
+                "Rules Distillery discovery failed.",
+                exc,
+                component="Rules Distillery discovery",
+                context={
+                    "profile_id": profile_id,
+                    "before_file": clean_text(
+                        getattr(before_upload, "name", "")
+                    ),
+                    "after_file": clean_text(
+                        getattr(after_upload, "name", "")
+                    ),
+                },
+            )
+
+
+def render_distillery_overview(
+    result: Mapping[str, Any],
+) -> None:
+    report = result.get("report") or {}
+    matching = report.get("matching") or {}
+    rules = report.get("rules") or {}
+    validation = report.get("validation") or {}
+    holdout = report.get("holdout") or {}
+    gap_report = report.get("gaps") or {}
+    metrics = st.columns(4)
+    metrics[0].metric(
+        "Corpus rows",
+        f"{int(matching.get('pairs') or 0):,}",
+        help="Matched BEFORE/AFTER logical rows.",
+    )
+    metrics[1].metric(
+        "Exact outcomes",
+        f"{int(validation.get('exact_count') or 0):,}",
+        f"{float(validation.get('accuracy') or 0.0):.2%}",
+    )
+    metrics[2].metric(
+        "Candidate rules",
+        f"{int(rules.get('total') or 0):,}",
+        f"{int(rules.get('draft_amendments') or 0):,} amendments",
+    )
+    metrics[3].metric(
+        "Residual rows",
+        f"{int(gap_report.get('count') or 0):,}",
+        f"{int(gap_report.get('cluster_count') or 0):,} clusters",
+        delta_color="inverse",
+    )
+    if bool_value((report.get("deployment_gate") or {}).get("eligible")):
+        st.success(
+            "This candidate passed every activation gate and is ready for "
+            "controlled activation."
+        )
+    else:
+        st.warning(
+            "This is a working candidate, not a failed run. Save it, test it, "
+            "and iterate on its largest residual clusters. Activation remains "
+            "protected until the evidence reaches exact parity."
+        )
+    blockers = distillery_gate_blockers(report)
+    st.markdown("#### What to work next")
+    if blockers:
+        dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        key: value
+                        for key, value in blocker.items()
+                        if key != "_key"
+                    }
+                    for blocker in blockers[:8]
+                ]
+            ),
+            height=min(360, 38 + len(blockers[:8]) * 54),
+        )
+    else:
+        st.success("No activation blockers remain.")
+    convergence = report.get("convergence") or []
+    if convergence:
+        st.markdown("#### Discovery convergence")
+        dataframe(pd.DataFrame(convergence), height=330)
+    st.caption(
+        "Holdout: "
+        + (
+            f"complete · minimum {float(holdout.get('minimum_accuracy') or 0.0):.2%}"
+            if bool_value(holdout.get("completed"))
+            else "not run yet"
+        )
+    )
+
+
+def render_rules_distillery_operator_page(
+    store: SnowflakeRulesStore,
+) -> None:
+    render_page_header(
+        "Rules Distillery",
+        (
+            "Turn dated BEFORE/AFTER evidence into readable Product Request "
+            "logic, then test and govern each immutable candidate."
+        ),
+        kicker="Mechanized Rule Discovery",
+    )
+    header_columns = st.columns([3, 1])
+    profile_id = header_columns[0].selectbox(
+        "Ruleset profile",
+        list(DISTILLERY_PROFILES),
+        format_func=lambda value: clean_text(
+            DISTILLERY_PROFILES[value].get("description")
+        ),
+        key="distillery_v8_profile",
+    )
+    header_columns[1].success(
+        "Active rules protected",
+        icon=":material/lock:",
+    )
+    try:
+        persisted_aliases = store.load_outcome_aliases(profile_id)
+    except Exception as exc:
+        persisted_aliases = {}
+        render_actionable_exception(
+            "Outcome aliases could not be loaded.",
+            exc,
+            component="Distillery outcome aliases",
+            context={"profile_id": profile_id},
+        )
+    result = st.session_state.get("_literal_distillery_result")
+    has_result = (
+        isinstance(result, Mapping)
+        and clean_text(result.get("profile_id")) == profile_id
+    )
+    workspace_options = [
+        *(["Review latest run"] if has_result else []),
+        "New distillation",
+        "Saved versions",
+    ]
+    pending_workspace = clean_text(
+        st.session_state.pop(
+            "_distillery_v8_pending_workspace",
+            "",
+        )
+    )
+    if pending_workspace in workspace_options:
+        st.session_state["_distillery_v8_workspace"] = pending_workspace
+    existing_workspace = clean_text(
+        st.session_state.get("_distillery_v8_workspace")
+    )
+    if existing_workspace not in workspace_options:
+        st.session_state["_distillery_v8_workspace"] = (
+            "Review latest run" if has_result else "New distillation"
+        )
+    workspace = st.radio(
+        "Workspace",
+        workspace_options,
+        horizontal=True,
+        key="_distillery_v8_workspace",
+        label_visibility="collapsed",
+    )
+    st.divider()
+    if workspace == "New distillation":
+        render_distillery_new_run(
+            store,
+            profile_id,
+            persisted_aliases=persisted_aliases,
+        )
+        return
+    if workspace == "Saved versions":
+        render_distillery_saved_versions(store, profile_id)
+        return
+    if not has_result:
+        st.info("Run a distillation to open the review workspace.")
+        return
+    render_distillery_review(
+        store,
+        result,
+        profile_id=profile_id,
+        persisted_aliases=persisted_aliases,
+    )
+
+
+def render_distillery_rule_review(
+    store: SnowflakeRulesStore,
+    result: Mapping[str, Any],
+    *,
+    profile_id: str,
+    persisted_aliases: Mapping[str, Any],
+) -> None:
+    report = result.get("report") or {}
+    records = distillery_rule_review_records(
+        result.get("catalog") or []
+    )
+    if not records:
+        st.info("No candidate rules were produced.")
+        return
+    controls = st.columns([2, 1, 1])
+    search = controls[0].text_input(
+        "Find a candidate rule",
+        placeholder="Name, stage, clause, filter, or outcome",
+        key="distillery_v8_rule_search",
+    )
+    statuses = sorted(
+        {clean_text(row.get("Status")) for row in records}
+    )
+    selected_status = controls[1].selectbox(
+        "Policy status",
+        ["All", *statuses],
+        key="distillery_v8_rule_status",
+    )
+    stages = sorted({int(row.get("Stage") or 0) for row in records})
+    selected_stage = controls[2].selectbox(
+        "Stage",
+        ["All", *stages],
+        key="distillery_v8_rule_stage",
+    )
+    query = search.lower().strip()
+    filtered = []
+    for row in records:
+        if (
+            selected_status != "All"
+            and clean_text(row.get("Status")) != selected_status
+        ):
+            continue
+        if (
+            selected_stage != "All"
+            and int(row.get("Stage") or 0) != int(selected_stage)
+        ):
+            continue
+        haystack = " ".join(
+            clean_text(value)
+            for key, value in row.items()
+            if key != "Logic signature"
+        ).lower()
+        if query and query not in haystack:
+            continue
+        filtered.append(row)
+    st.caption(
+        f"Showing {min(len(filtered), 250):,} of {len(filtered):,} matching "
+        f"rules ({len(records):,} total)."
+    )
+    dataframe(
+        pd.DataFrame(filtered[:250]),
+        height=min(620, 38 + min(len(filtered), 16) * 35),
+    )
+
+    pending = [
+        *(report.get("pending_amendments") or []),
+        *(report.get("pending_rule_approvals") or []),
+    ]
+    pending_by_signature = {
+        clean_text(item.get("logic_signature")): item
+        for item in pending
+        if clean_text(item.get("logic_signature"))
+    }
+    if not pending_by_signature:
+        return
+    st.markdown("#### Explicit policy decisions")
+    st.caption(
+        "Approving a discovered amendment rebuilds the candidate; it never "
+        "edits the active catalog."
+    )
+    selected = st.multiselect(
+        "Approve reviewed amendments",
+        list(pending_by_signature),
+        format_func=lambda value: clean_text(
+            pending_by_signature[value].get("name")
+        )
+        or value[:12],
+        key=f"distillery_v8_approvals_{result.get('run_id')}",
+    )
+    bundle = st.session_state.get("_distillery_v8_source_bundle")
+    if st.button(
+        "Approve and rebuild draft",
+        disabled=not selected or not isinstance(bundle, Mapping),
+        key="distillery_v8_apply_approvals",
+    ):
+        try:
+            approval_key = f"_literal_rule_approvals_{profile_id}"
+            combined = sorted(
+                {
+                    *[
+                        clean_text(value)
+                        for value in st.session_state.get(approval_key, [])
+                        if clean_text(value)
+                    ],
+                    *selected,
+                }
+            )
+            st.session_state[approval_key] = combined
+            with st.status(
+                "Rebuilding with approved policy decisions...",
+                expanded=True,
+            ) as progress:
+                rebuilt = run_distillery_source_bundle(
+                    store,
+                    bundle,
+                    run_holdouts=bool_value(
+                        (report.get("holdout") or {}).get("completed")
+                    ),
+                    outcome_aliases=persisted_aliases,
+                    approved_rule_signatures=combined,
+                    mutation_classifications=st.session_state.get(
+                        f"_mutation_classifications_{profile_id}",
+                        {},
+                    ),
+                    approved_ambiguous_pair_ids=st.session_state.get(
+                        f"_approved_ambiguous_pairs_{profile_id}",
+                        [],
+                    ),
+                )
+                progress.update(
+                    label="Candidate rebuilt.",
+                    state="complete",
+                )
+            st.session_state["_literal_distillery_result"] = rebuilt
+            set_flash(
+                f"Applied {len(combined):,} explicit policy approval(s)."
+            )
+            safe_rerun()
+        except Exception as exc:
+            render_actionable_exception(
+                "The candidate could not be rebuilt with approvals.",
+                exc,
+                component="Distillery amendment approval",
+                context={"profile_id": profile_id},
+            )
+
+
+def render_distillery_gap_review(
+    result: Mapping[str, Any],
+) -> None:
+    report = result.get("report") or {}
+    gap_report = report.get("gaps") or {}
+    gaps = result.get("gaps") or []
+    clusters = gap_report.get("clusters") or []
+    if not gaps:
+        st.success("No unexplained rows remain.")
+        return
+    st.warning(
+        f"{len(gaps):,} rows remain unexplained, organized into "
+        f"{len(clusters):,} semantic clusters. Work the clusters—not "
+        "thousands of individual rows."
+    )
+    if not clusters:
+        dataframe(pd.DataFrame(gaps[:100]), height=520)
+        return
+    cluster_rows = [
+        {
+            "Cluster": clean_text(item.get("cluster_signature"))[:12],
+            "Rows": int(item.get("row_count") or 0),
+            "Business": clean_text(item.get("business")),
+            "Request type": clean_text(item.get("request_type")),
+            "Expected outcome": json.dumps(
+                item.get("expected_outcome") or {},
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            "Observed outcome": json.dumps(
+                item.get("observed_outcome") or {},
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            "Dates": len(item.get("supporting_dates") or []),
+            "Next action": clean_text(item.get("next_action")),
+            "_signature": clean_text(item.get("cluster_signature")),
+        }
+        for item in clusters
+    ]
+    dataframe(
+        pd.DataFrame(
+            [
+                {
+                    key: value
+                    for key, value in row.items()
+                    if key != "_signature"
+                }
+                for row in cluster_rows[:300]
+            ]
+        ),
+        height=440,
+    )
+    signatures = [row["_signature"] for row in cluster_rows]
+    selected_signature = st.selectbox(
+        "Inspect residual cluster",
+        signatures,
+        format_func=lambda value: next(
+            (
+                f"{row['Rows']:,} rows · {row['Business'] or 'Any business'} "
+                f"· {row['Request type'] or 'Any request type'} · {value[:10]}"
+            )
+            for row in cluster_rows
+            if row["_signature"] == value
+        ),
+        key=f"distillery_v8_gap_cluster_{result.get('run_id')}",
+    )
+    selected_cluster = next(
+        item
+        for item in clusters
+        if clean_text(item.get("cluster_signature"))
+        == selected_signature
+    )
+    example_ids = set(selected_cluster.get("example_pair_ids") or [])
+    expected = selected_cluster.get("expected_outcome") or {}
+    observed = selected_cluster.get("observed_outcome") or {}
+    cluster_gaps = [
+        gap
+        for gap in gaps
+        if (
+            clean_text(gap.get("pair_id")) in example_ids
+            or (
+                (gap.get("expected_outcome") or {}) == expected
+                and (gap.get("observed_outcome") or {}) == observed
+                and clean_text((gap.get("evidence") or {}).get("business"))
+                == clean_text(selected_cluster.get("business"))
+                and clean_text((gap.get("evidence") or {}).get("type"))
+                == clean_text(selected_cluster.get("request_type"))
+            )
+        )
+    ]
+    st.markdown("#### Evidence sample")
+    st.caption(
+        f"Showing {min(len(cluster_gaps), 100):,} of "
+        f"{int(selected_cluster.get('row_count') or len(cluster_gaps)):,} "
+        "rows in this cluster."
+    )
+    dataframe(pd.DataFrame(cluster_gaps[:100]), height=430)
+
+
+def render_distillery_data_readiness(
+    store: SnowflakeRulesStore,
+    result: Mapping[str, Any],
+    *,
+    profile_id: str,
+    persisted_aliases: Mapping[str, Any],
+) -> None:
+    report = result.get("report") or {}
+    policy_report = report.get("policy_pack") or {}
+    reference_report = report.get("reference_contracts") or {}
+    matching = report.get("matching") or {}
+    readiness = st.columns(4)
+    readiness[0].metric(
+        "Policy clauses",
+        int(policy_report.get("clause_count") or 0),
+    )
+    readiness[1].metric(
+        "References ready",
+        len(reference_report.get("uploaded") or [])
+        + len(reference_report.get("snowflake_object_mappings") or {}),
+    )
+    readiness[2].metric(
+        "References missing",
+        len(reference_report.get("missing") or []),
+    )
+    readiness[3].metric(
+        "Ambiguous pairs",
+        len(matching.get("unresolved_ambiguous_pair_ids") or []),
+    )
+    if reference_report.get("missing"):
+        st.warning(
+            "Missing governed references: "
+            + ", ".join(reference_report.get("missing") or [])
+            + ". Add these through New distillation when they are available."
+        )
+    with st.expander("Policy source lineage", expanded=False):
+        sources = policy_report.get("sources") or []
+        if sources:
+            dataframe(pd.DataFrame(sources), height=300)
+        else:
+            st.caption("No normalized policy sources are present.")
+
+    bundle = st.session_state.get("_distillery_v8_source_bundle")
+    ambiguous_matches = matching.get("ambiguous_match_records") or []
+    unresolved = [
+        item
+        for item in ambiguous_matches
+        if clean_text(item.get("status")) != "approved"
+    ]
+    if unresolved:
+        st.markdown("#### Confirm ambiguous row pairings")
+        dataframe(pd.DataFrame(unresolved), height=240)
+        pair_by_id = {
+            clean_text(item.get("pair_id")): item
+            for item in unresolved
+        }
+        selected_pairs = st.multiselect(
+            "Reviewed pairings",
+            list(pair_by_id),
+            format_func=lambda value: (
+                f"{clean_text(pair_by_id[value].get('source_group'))} "
+                f"· {clean_text(pair_by_id[value].get('case')) or value[:10]}"
+            ),
+            key=f"distillery_v8_pair_review_{result.get('run_id')}",
+        )
+        if st.button(
+            "Confirm pairings and rebuild",
+            disabled=not selected_pairs or not isinstance(bundle, Mapping),
+            key="distillery_v8_confirm_pairs",
+        ):
+            approval_key = f"_approved_ambiguous_pairs_{profile_id}"
+            combined_pairs = sorted(
+                {
+                    *st.session_state.get(approval_key, []),
+                    *selected_pairs,
+                }
+            )
+            st.session_state[approval_key] = combined_pairs
+            try:
+                with st.status(
+                    "Rebuilding with confirmed evidence alignment...",
+                    expanded=True,
+                ) as progress:
+                    rebuilt = run_distillery_source_bundle(
+                        store,
+                        bundle,
+                        run_holdouts=bool_value(
+                            (report.get("holdout") or {}).get(
+                                "completed"
+                            )
+                        ),
+                        outcome_aliases=persisted_aliases,
+                        approved_rule_signatures=st.session_state.get(
+                            f"_literal_rule_approvals_{profile_id}",
+                            [],
+                        ),
+                        mutation_classifications=st.session_state.get(
+                            f"_mutation_classifications_{profile_id}",
+                            {},
+                        ),
+                        approved_ambiguous_pair_ids=combined_pairs,
+                    )
+                    progress.update(
+                        label="Evidence alignment rebuilt.",
+                        state="complete",
+                    )
+                st.session_state["_literal_distillery_result"] = rebuilt
+                set_flash("Reviewed row pairings were confirmed.")
+                safe_rerun()
+            except Exception as exc:
+                render_actionable_exception(
+                    "The reviewed row pairings could not be applied.",
+                    exc,
+                    component="Distillery evidence alignment",
+                    context={"profile_id": profile_id},
+                )
+
+    mutation_inventory = report.get("mutation_inventory") or {}
+    mutation_rows = [
+        {
+            "Field": clean_text(item.get("field_name")),
+            "Changed rows": int(item.get("changed_rows") or 0),
+            "Classification": clean_text(item.get("classification")),
+        }
+        for item in mutation_inventory.get("records") or []
+    ]
+    if mutation_rows:
+        st.markdown("#### Non-output field changes")
+        edited_mutations = st.data_editor(
+            pd.DataFrame(mutation_rows),
+            disabled=["Field", "Changed rows"],
+            hide_index=True,
+            use_container_width=True,
+            column_config={
+                "Classification": st.column_config.SelectboxColumn(
+                    options=[
+                        "enrichment",
+                        "correction",
+                        "volatile_metadata",
+                        "unresolved",
+                    ],
+                    required=True,
+                )
+            },
+            key=f"distillery_v8_mutations_{result.get('run_id')}",
+        )
+        if st.button(
+            "Apply classifications and rebuild",
+            disabled=not isinstance(bundle, Mapping),
+            key="distillery_v8_apply_mutations",
+        ):
+            classifications = {
+                clean_text(row.get("Field")): clean_text(
+                    row.get("Classification")
+                )
+                for row in edited_mutations.to_dict(orient="records")
+            }
+            st.session_state[
+                f"_mutation_classifications_{profile_id}"
+            ] = classifications
+            try:
+                with st.status(
+                    "Rebuilding with the reviewed field contract...",
+                    expanded=True,
+                ) as progress:
+                    rebuilt = run_distillery_source_bundle(
+                        store,
+                        bundle,
+                        run_holdouts=bool_value(
+                            (report.get("holdout") or {}).get(
+                                "completed"
+                            )
+                        ),
+                        outcome_aliases=persisted_aliases,
+                        approved_rule_signatures=st.session_state.get(
+                            f"_literal_rule_approvals_{profile_id}",
+                            [],
+                        ),
+                        mutation_classifications=classifications,
+                        approved_ambiguous_pair_ids=st.session_state.get(
+                            f"_approved_ambiguous_pairs_{profile_id}",
+                            [],
+                        ),
+                    )
+                    progress.update(
+                        label="Field contract applied.",
+                        state="complete",
+                    )
+                st.session_state["_literal_distillery_result"] = rebuilt
+                set_flash("Mutation classifications were applied.")
+                safe_rerun()
+            except Exception as exc:
+                render_actionable_exception(
+                    "The field classifications could not be applied.",
+                    exc,
+                    component="Distillery mutation contract",
+                    context={"profile_id": profile_id},
+                )
+
+    alias_registry = (report.get("labels") or {}).get(
+        "alias_registry"
+    ) or {}
+    alias_rows = [
+        {
+            "Field": clean_text(item.get("field_name")),
+            "Raw value": clean_text(item.get("raw_value")),
+            "Canonical value": clean_text(item.get("canonical_value")),
+            "Rows": int(item.get("row_count") or 0),
+            "Status": clean_text(item.get("status")),
+        }
+        for item in alias_registry.get("entries") or []
+    ]
+    if alias_rows:
+        with st.expander("Outcome aliases", expanded=False):
+            alias_frame = pd.DataFrame(alias_rows)
+            edited_aliases = st.data_editor(
+                alias_frame,
+                disabled=["Field", "Raw value", "Rows", "Status"],
+                hide_index=True,
+                use_container_width=True,
+                key=f"distillery_v8_aliases_{result.get('run_id')}",
+            )
+            if st.button(
+                "Save reviewed aliases",
+                key="distillery_v8_save_aliases",
+            ):
+                try:
+                    saved_count = store.save_outcome_aliases(
+                        profile_id,
+                        [
+                            {
+                                "field_name": clean_text(
+                                    row.get("Field")
+                                ),
+                                "raw_value": clean_text(
+                                    row.get("Raw value")
+                                ),
+                                "canonical_value": clean_text(
+                                    row.get("Canonical value")
+                                ),
+                            }
+                            for row in edited_aliases.to_dict(
+                                orient="records"
+                            )
+                        ],
+                    )
+                    set_flash(
+                        f"Saved {saved_count:,} reviewed aliases. Rebuild "
+                        "the draft to apply them."
+                    )
+                    safe_rerun()
+                except Exception as exc:
+                    render_actionable_exception(
+                        "Reviewed aliases could not be saved.",
+                        exc,
+                        component="Distillery outcome aliases",
+                        context={"profile_id": profile_id},
+                    )
+
+
+def render_distillery_validation(
+    result: Mapping[str, Any],
+) -> None:
+    report = result.get("report") or {}
+    holdout = report.get("holdout") or {}
+    tests = report.get("tests") or {}
+    blockers = distillery_gate_blockers(report)
+    status_columns = st.columns(4)
+    status_columns[0].metric(
+        "Corpus parity",
+        f"{float((report.get('validation') or {}).get('accuracy') or 0.0):.2%}",
+    )
+    status_columns[1].metric(
+        "Holdout status",
+        "Complete" if bool_value(holdout.get("completed")) else "Not run",
+    )
+    status_columns[2].metric(
+        "Minimum holdout",
+        (
+            f"{float(holdout.get('minimum_accuracy') or 0.0):.2%}"
+            if bool_value(holdout.get("completed"))
+            else "—"
+        ),
+    )
+    status_columns[3].metric(
+        "Gate blockers",
+        len(blockers),
+    )
+    if not bool_value(holdout.get("completed")):
+        st.info(
+            "The quick discovery pass deliberately skipped the expensive "
+            "leave-one-date-out run. Use Run activation validation above "
+            "when the draft is ready for a full gate check."
+        )
+    folds = holdout.get("folds") or {}
+    if isinstance(folds, Mapping) and folds:
+        st.markdown("#### Leave-one-date-out results")
+        dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        "Date / source": group,
+                        "Testing rows": int(
+                            values.get("testing_rows") or 0
+                        ),
+                        "Reusable rules": int(
+                            values.get("rule_count") or 0
+                        ),
+                        "Accuracy": float(
+                            values.get("accuracy") or 0.0
+                        ),
+                        "Exact": int(values.get("exact") or 0),
+                        "Uncovered": int(
+                            values.get("uncovered") or 0
+                        ),
+                        "Mismatched": int(
+                            values.get("mismatched") or 0
+                        ),
+                    }
+                    for group, values in folds.items()
+                ]
+            ),
+            height=420,
+        )
+    st.markdown("#### Safety tests")
+    boundary = tests.get("boundary") or {}
+    metamorphic = tests.get("metamorphic") or {}
+    terminal = tests.get("terminal_path") or {}
+    test_rows = [
+        {
+            "Test": "Documented numeric boundaries",
+            "Status": (
+                "Pass"
+                if int(boundary.get("unsupported_count") or 0) == 0
+                else "Fail"
+            ),
+            "Failures": int(boundary.get("unsupported_count") or 0),
+        },
+        {
+            "Test": "Identity and irrelevant-field invariance",
+            "Status": (
+                "Pass"
+                if int(metamorphic.get("failure_count") or 0) == 0
+                else "Fail"
+            ),
+            "Failures": int(metamorphic.get("failure_count") or 0),
+        },
+        {
+            "Test": "Exactly one terminal outcome",
+            "Status": (
+                "Pass"
+                if int(terminal.get("failure_count") or 0) == 0
+                else "Fail"
+            ),
+            "Failures": int(terminal.get("failure_count") or 0),
+        },
+    ]
+    dataframe(pd.DataFrame(test_rows), height=160)
+    if blockers:
+        st.markdown("#### Complete activation checklist")
+        dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        key: value
+                        for key, value in blocker.items()
+                        if key != "_key"
+                    }
+                    for blocker in blockers
+                ]
+            ),
+            height=min(620, 38 + len(blockers) * 54),
+        )
+    else:
+        st.success("Every activation requirement is satisfied.")
+
+
+def render_distillery_review(
+    store: SnowflakeRulesStore,
+    result: Mapping[str, Any],
+    *,
+    profile_id: str,
+    persisted_aliases: Mapping[str, Any],
+) -> None:
+    report = result.get("report") or {}
+    validation = report.get("validation") or {}
+    gate = report.get("deployment_gate") or {}
+    run_id = clean_text(result.get("run_id"))
+    st.markdown("### Latest candidate")
+    st.caption(
+        f"Run {run_id} · {int(validation.get('row_count') or 0):,} rows · "
+        f"created {clean_text(report.get('created_at'))[:19].replace('T', ' ')}"
+    )
+    action_columns = st.columns([1.2, 1.4, 1.2, 1])
+    catalog = result.get("catalog") or []
+    if action_columns[0].button(
+        "Save immutable draft",
+        type="primary",
+        disabled=not catalog,
+        key="distillery_v8_save_draft",
+        help=(
+            "Saving is allowed before activation parity so this candidate can "
+            "be tested and compared. It cannot activate until every gate passes."
+        ),
+    ):
+        try:
+            with st.status(
+                "Saving immutable candidate and gap evidence...",
+                expanded=True,
+            ) as progress:
+                version = store.save_catalog_candidate(
+                    catalog,
+                    report,
+                    result.get("gaps") or [],
+                )
+                progress.update(
+                    label=(
+                        f"Saved catalog version "
+                        f"{int(version.get('version_number') or 0)}."
+                    ),
+                    state="complete",
+                )
+            st.session_state["_literal_selected_version"] = clean_text(
+                version.get("id")
+            )
+            set_flash(
+                "Immutable candidate saved. It is available for isolated "
+                "testing; active rules were not changed."
+            )
+            safe_rerun()
+        except Exception as exc:
+            render_actionable_exception(
+                "The immutable candidate could not be saved.",
+                exc,
+                component="Distillery catalog version",
+                context={"profile_id": profile_id, "run_id": run_id},
+            )
+
+    source_bundle = st.session_state.get("_distillery_v8_source_bundle")
+    if action_columns[1].button(
+        "Run activation validation",
+        disabled=not isinstance(source_bundle, Mapping),
+        key="distillery_v8_validate",
+        help=(
+            "Runs the expensive mandatory leave-one-date-out validation. "
+            "Use this after material rule or data-readiness improvements."
+        ),
+    ):
+        try:
+            with st.status(
+                "Running full corpus and leave-one-date-out validation...",
+                expanded=True,
+            ) as progress:
+                progress.write(
+                    "This is the expensive gate run. The current dated corpus "
+                    "is trained and tested once per held-out date."
+                )
+                validated = run_distillery_source_bundle(
+                    store,
+                    source_bundle,
+                    run_holdouts=True,
+                    outcome_aliases=persisted_aliases,
+                    approved_rule_signatures=st.session_state.get(
+                        f"_literal_rule_approvals_{profile_id}",
+                        [],
+                    ),
+                    mutation_classifications=st.session_state.get(
+                        f"_mutation_classifications_{profile_id}",
+                        {},
+                    ),
+                    approved_ambiguous_pair_ids=st.session_state.get(
+                        f"_approved_ambiguous_pairs_{profile_id}",
+                        [],
+                    ),
+                )
+                progress.update(
+                    label="Activation validation complete.",
+                    state="complete",
+                )
+            st.session_state["_literal_distillery_result"] = validated
+            set_flash(
+                (
+                    "Activation validation completed. "
+                    f"Minimum held-out-date accuracy: "
+                    f"{float((validated.get('report') or {}).get('holdout', {}).get('minimum_accuracy') or 0.0):.2%}."
+                ),
+                (
+                    "success"
+                    if bool_value(validated.get("deployment_eligible"))
+                    else "warning"
+                ),
+            )
+            safe_rerun()
+        except Exception as exc:
+            render_actionable_exception(
+                "Activation validation could not complete.",
+                exc,
+                component="Distillery activation validation",
+                context={"profile_id": profile_id, "run_id": run_id},
+            )
+
+    export_key = f"_distillery_v8_export_{run_id}"
+    if action_columns[2].button(
+        "Prepare full export",
+        key="distillery_v8_prepare_export",
+        help=(
+            "Build the large evidence package only on demand so normal "
+            "navigation remains responsive."
+        ),
+    ):
+        st.session_state[export_key] = json_dumps(
+            {
+                "run_id": run_id,
+                "profile_id": profile_id,
+                "report": report,
+                "catalog": catalog,
+                "gaps": result.get("gaps") or [],
+                "conflicts": result.get("conflicts") or [],
+                "policy_pack": result.get("policy_pack") or {},
+                "reference_pack": result.get("reference_pack") or {},
+                "exported_at": iso_now(),
+            },
+            pretty=True,
+        )
+    if action_columns[3].button(
+        "Discard local run",
+        key="distillery_v8_discard",
+    ):
+        st.session_state.pop("_literal_distillery_result", None)
+        st.session_state.pop("_distillery_v8_source_bundle", None)
+        st.session_state.pop(export_key, None)
+        st.session_state["_distillery_v8_pending_workspace"] = (
+            "New distillation"
+        )
+        set_flash("The transient Distillery run was cleared.", "info")
+        safe_rerun()
+    export_payload = st.session_state.get(export_key)
+    if isinstance(export_payload, str) and export_payload:
+        st.download_button(
+            "Download complete candidate package",
+            data=export_payload,
+            file_name=f"one_engine_distillery_{run_id}.json",
+            mime="application/json",
+            key="distillery_v8_download_export",
+        )
+
+    if bool_value(gate.get("eligible")):
+        st.success(
+            "Activation gate passed. Save this immutable version, test it, "
+            "then activate it from Saved versions."
+        )
+    else:
+        blockers = distillery_gate_blockers(report)
+        st.warning(
+            f"Working draft · {len(blockers):,} activation requirement(s) "
+            "remain. Saving and isolated testing are available now; only "
+            "activation is locked."
+        )
+
+    review_section = st.radio(
+        "Review area",
+        [
+            "Overview",
+            "Candidate rules",
+            "Residual clusters",
+            "Data readiness",
+            "Validation",
+        ],
+        horizontal=True,
+        key="distillery_v8_review_area",
+    )
+    st.divider()
+    if review_section == "Overview":
+        render_distillery_overview(result)
+    elif review_section == "Candidate rules":
+        render_distillery_rule_review(
+            store,
+            result,
+            profile_id=profile_id,
+            persisted_aliases=persisted_aliases,
+        )
+    elif review_section == "Residual clusters":
+        render_distillery_gap_review(result)
+    elif review_section == "Data readiness":
+        render_distillery_data_readiness(
+            store,
+            result,
+            profile_id=profile_id,
+            persisted_aliases=persisted_aliases,
+        )
+    else:
+        render_distillery_validation(result)
+
+
+def render_distillery_saved_versions(
+    store: SnowflakeRulesStore,
+    profile_id: str,
+) -> None:
+    st.markdown("### Saved catalog versions")
+    st.caption(
+        "Testing is always isolated. Activation is the only action that "
+        "materializes a candidate into the Product Request runtime."
+    )
+    try:
+        versions = store.list_catalog_versions(profile_id)
+    except Exception as exc:
+        render_actionable_exception(
+            "Catalog versions could not be loaded.",
+            exc,
+            component="Distillery catalog versions",
+            context={"profile_id": profile_id},
+        )
+        return
+    if not versions:
+        st.info(
+            "No saved versions exist yet. Discover a candidate and use Save "
+            "immutable draft; parity is not required to preserve a testable draft."
+        )
+        return
+    version_rows = [
+        {
+            "Version": int(item.get("version_number") or 0),
+            "Status": clean_text(item.get("status")),
+            "Rules": int(item.get("rule_count") or 0),
+            "Gaps": int(item.get("gap_count") or 0),
+            "Activation eligible": bool_value(
+                item.get("deployment_eligible")
+            ),
+            "Created": timestamp_text(item.get("created_at")),
+            "Activated": timestamp_text(item.get("activated_at")),
+            "ID": clean_text(item.get("id")),
+        }
+        for item in versions
+    ]
+    dataframe(
+        pd.DataFrame(version_rows),
+        height=min(380, 38 + len(version_rows) * 35),
+    )
+    version_by_id = {
+        clean_text(item.get("id")): item for item in versions
+    }
+    version_ids = list(version_by_id)
+    preferred = clean_text(
+        st.session_state.get("_literal_selected_version")
+    )
+    selected_index = (
+        version_ids.index(preferred)
+        if preferred in version_ids
+        else 0
+    )
+    selected_id = st.selectbox(
+        "Catalog version",
+        version_ids,
+        index=selected_index,
+        format_func=lambda value: (
+            f"v{int(version_by_id[value].get('version_number') or 0)} · "
+            f"{clean_text(version_by_id[value].get('status'))} · "
+            f"{int(version_by_id[value].get('rule_count') or 0):,} rules"
+        ),
+        key="distillery_v8_version",
+    )
+    selected = version_by_id[selected_id]
+    operation = st.radio(
+        "Version task",
+        [
+            "Test candidate",
+            "Activate or roll back",
+            "Resolve saved gaps",
+            "Audit history",
+        ],
+        horizontal=True,
+        key="distillery_v8_version_task",
+    )
+    st.divider()
+    if operation == "Test candidate":
+        st.caption(
+            "The active and selected catalogs run against cloned in-memory "
+            "rows. No batch, run, result, or workflow row is written."
+        )
+        source_kind = st.radio(
+            "Test data",
+            [
+                "Existing batch",
+                "Upload Product Request file",
+                "Live Product Request data",
+            ],
+            horizontal=True,
+            key="distillery_v8_test_source",
+        )
+        batches: list[dict[str, Any]] = []
+        selected_batch_id = ""
+        candidate_upload = None
+        if source_kind == "Existing batch":
+            batches = store.list_batches()
+            if batches:
+                selected_batch_id = st.selectbox(
+                    "Batch",
+                    [clean_text(item.get("id")) for item in batches],
+                    format_func=lambda value: next(
+                        (
+                            f"{clean_text(item.get('name'))} · "
+                            f"{int(item.get('row_count') or 0):,} rows"
+                        )
+                        for item in batches
+                        if clean_text(item.get("id")) == value
+                    ),
+                    key="distillery_v8_test_batch",
+                )
+            else:
+                st.info("No stored batches are available.")
+        elif source_kind == "Upload Product Request file":
+            candidate_upload = st.file_uploader(
+                "Product Request test file",
+                type=["csv", "txt", "tsv", "xlsx", "xlsm"],
+                key="distillery_v8_test_upload",
+            )
+        else:
+            st.info(
+                f"Comparison reads {TARGET_DATABASE}.{TARGET_SCHEMA}."
+                f"{LIVE_PRODUCT_REQUEST_VIEW} once."
+            )
+        can_test = (
+            bool(selected_batch_id)
+            if source_kind == "Existing batch"
+            else candidate_upload is not None
+            if source_kind == "Upload Product Request file"
+            else True
+        )
+        if st.button(
+            "Compare active vs selected version",
+            type="primary",
+            disabled=not can_test,
+            key="distillery_v8_compare",
+        ):
+            try:
+                with st.status(
+                    "Running isolated catalog comparison...",
+                    expanded=True,
+                ) as progress:
+                    if source_kind == "Existing batch":
+                        source_rows = store.load_rows(selected_batch_id)
+                        source_label = next(
+                            clean_text(item.get("name"))
+                            for item in batches
+                            if clean_text(item.get("id"))
+                            == selected_batch_id
+                        )
+                    elif source_kind == "Upload Product Request file":
+                        parsed = parse_source_workbook(
+                            clean_text(candidate_upload.name),
+                            candidate_upload.getvalue(),
+                        )
+                        source_rows = workflow_rows_from_parsed(parsed)
+                        source_label = clean_text(candidate_upload.name)
+                    else:
+                        parsed, _, metadata = (
+                            store.load_live_product_request_data()
+                        )
+                        source_rows = workflow_rows_from_parsed(
+                            parsed,
+                            "candidate-live-test",
+                        )
+                        source_label = clean_text(
+                            metadata.get("source_view")
+                        )
+                    comparison = compare_catalog_version(
+                        store,
+                        selected_id,
+                        source_rows,
+                        source_label=source_label,
+                    )
+                    progress.update(
+                        label="Isolated comparison complete.",
+                        state="complete",
+                    )
+                st.session_state[
+                    "_literal_distillery_comparison"
+                ] = comparison
+                set_flash(
+                    f"Compared {comparison['row_count']:,} rows without "
+                    "changing active rules or stored data."
+                )
+                safe_rerun()
+            except Exception as exc:
+                render_actionable_exception(
+                    "The isolated catalog comparison failed.",
+                    exc,
+                    component="Distillery candidate test",
+                    context={
+                        "catalog_version_id": selected_id,
+                        "test_source": source_kind,
+                    },
+                )
+        comparison = st.session_state.get(
+            "_literal_distillery_comparison"
+        )
+        if (
+            isinstance(comparison, Mapping)
+            and clean_text(comparison.get("catalog_version_id"))
+            == selected_id
+        ):
+            comparison_metrics = st.columns(3)
+            comparison_metrics[0].metric(
+                "Rows",
+                f"{int(comparison.get('row_count') or 0):,}",
+            )
+            comparison_metrics[1].metric(
+                "Same atomic result",
+                f"{int(comparison.get('same_count') or 0):,}",
+            )
+            comparison_metrics[2].metric(
+                "Different",
+                f"{int(comparison.get('different_count') or 0):,}",
+            )
+            records = comparison.get("records") or []
+            differences = [
+                row
+                for row in records
+                if not bool_value(row.get("Same atomic result"))
+            ]
+            dataframe(
+                pd.DataFrame((differences or records)[:1000]),
+                height=540,
+            )
+        return
+
+    if operation == "Activate or roll back":
+        status = clean_text(selected.get("status")).upper()
+        eligible = bool_value(selected.get("deployment_eligible"))
+        if status == "ACTIVE":
+            st.success("This version is the active Product Request catalog.")
+            return
+        action_word = "Roll back" if status == "RETIRED" else "Activate"
+        if status == "CANDIDATE" and not eligible:
+            st.warning(
+                "This draft is available for testing, but activation remains "
+                "locked because its saved evidence gate was not eligible."
+            )
+        confirmation = st.checkbox(
+            (
+                f"I confirm {action_word.lower()} to Product Request catalog "
+                f"version {int(selected.get('version_number') or 0)}."
+            ),
+            key=f"distillery_v8_activate_confirm_{selected_id}",
+        )
+        if st.button(
+            f"{action_word} selected catalog version",
+            type="primary",
+            disabled=(
+                not confirmation
+                or (status == "CANDIDATE" and not eligible)
+            ),
+            key=f"distillery_v8_activate_{selected_id}",
+        ):
+            try:
+                activated = store.activate_catalog_version(selected_id)
+                set_flash(
+                    f"Product Request catalog version "
+                    f"{int(activated.get('version_number') or 0)} is active."
+                )
+                safe_rerun()
+            except Exception as exc:
+                render_actionable_exception(
+                    "The catalog version could not be activated.",
+                    exc,
+                    component="Distillery activation",
+                    context={
+                        "catalog_version_id": selected_id,
+                        "status": status,
+                    },
+                )
+        return
+
+    if operation == "Resolve saved gaps":
+        gaps = store.list_distillery_gaps(selected_id, limit=500)
+        if not gaps:
+            st.success("This version has no persisted gaps.")
+            return
+        st.caption(
+            "Showing at most 500 saved gap records. Resolve evidence here, "
+            "then rebuild a new immutable candidate; saved versions never mutate."
+        )
+        dataframe(pd.DataFrame(gaps), height=480)
+        open_gaps = [
+            item
+            for item in gaps
+            if clean_text(item.get("status")).upper() != "RESOLVED"
+        ]
+        if not open_gaps:
+            st.success("Every displayed gap is resolved.")
+            return
+        gap_by_id = {
+            clean_text(item.get("id")): item for item in open_gaps
+        }
+        gap_id = st.selectbox(
+            "Open gap",
+            list(gap_by_id),
+            format_func=lambda value: (
+                f"{clean_text(gap_by_id[value].get('source_group'))} · "
+                f"{clean_text(gap_by_id[value].get('pair_id'))}"
+            ),
+            key=f"distillery_v8_gap_{selected_id}",
+        )
+        resolution = st.text_area(
+            "Resolution note",
+            key=f"distillery_v8_gap_note_{gap_id}",
+        )
+        if st.button(
+            "Resolve selected gap",
+            disabled=not clean_text(resolution),
+            key=f"distillery_v8_resolve_{gap_id}",
+        ):
+            try:
+                store.resolve_distillery_gap(gap_id, resolution)
+                set_flash(
+                    "Gap resolution recorded. Rebuild before activation."
+                )
+                safe_rerun()
+            except Exception as exc:
+                render_actionable_exception(
+                    "The Distillery gap could not be resolved.",
+                    exc,
+                    component="Distillery gap queue",
+                    context={"gap_id": gap_id},
+                )
+        return
+
+    events = [
+        event
+        for event in store.list_audit(limit=250)
+        if clean_text(event.get("entity_type")) == "catalog_version"
+    ]
+    if events:
+        dataframe(pd.DataFrame(audit_table_records(events)), height=540)
+    else:
+        st.info("No catalog-version audit events have been recorded.")
+
+
 def render_rules_catalog_page(store: SnowflakeRulesStore) -> None:
     render_page_header(
         "Rules Catalog",
@@ -16583,7 +18370,7 @@ def main() -> None:
         elif page == "Reports":
             render_reports_page(store, selected_batch)
         elif page == "Rules Distillery":
-            render_rules_distillery_page(store)
+            render_rules_distillery_operator_page(store)
         elif page == "Rules Catalog":
             render_rules_catalog_page(store)
         elif page == "Simulator":
